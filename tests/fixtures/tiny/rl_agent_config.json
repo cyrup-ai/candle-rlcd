@@ -1,0 +1,19 @@
+{
+  "encoder": "tiny",
+  "head_layers": 2,
+  "act_costs": {
+    "act": 0.0
+  },
+  "max_len": 128,
+  "head_max_len": 48,
+  "temperature": [
+    1.3,
+    0.8,
+    1.0
+  ],
+  "temperature_by_options": {
+    "choice:3-5": 1.7,
+    "score:3-5": 0.1,
+    "noul:2": 2.0
+  }
+}
