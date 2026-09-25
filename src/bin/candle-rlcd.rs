@@ -63,9 +63,14 @@ enum Cmd {
         /// Require `Authorization: Bearer <key>` (also read from CANDLE_RLCD_API_KEY).
         #[arg(long, env = "CANDLE_RLCD_API_KEY", hide_env_values = true)]
         api_key: Option<String>,
-        /// Add laya's extra answer fields (answer_confidence, act_probability).
+        /// Add laya's extra answer fields (answer_confidence, act_probability) and how each
+        /// question was fitted (state_chunks, option_batches, truncated).
         #[arg(long)]
         extended: bool,
+        /// A question whose instructions and options don't fit the model's input: `strict`
+        /// answers 422, `report` cuts it and counts it in the x-truncated-questions header.
+        #[arg(long, default_value = "strict", value_parser = ["strict", "report"])]
+        truncation: String,
         #[command(flatten)]
         engine: EngineArgs,
     },
@@ -318,6 +323,7 @@ fn main() -> Result<()> {
             model_name,
             api_key,
             extended,
+            truncation,
             engine,
         } => {
             let engine = load_engine(&model.model, &model.dtype, model.cpu, &engine)?;
@@ -338,6 +344,10 @@ fn main() -> Result<()> {
                 release_date: release_date(&dir),
                 api_key,
                 extended,
+                truncation: match truncation.as_str() {
+                    "report" => candle_rlcd::serve::TruncationPolicy::Report,
+                    _ => candle_rlcd::serve::TruncationPolicy::Strict,
+                },
             };
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)

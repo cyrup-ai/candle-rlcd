@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use candle_core::{DType, Device};
-use candle_rlcd::serve::{router, Engine, EngineConfig, ServeConfig};
+use candle_rlcd::serve::{router, Engine, EngineConfig, ServeConfig, TruncationPolicy};
 use candle_rlcd::Laya;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -42,6 +42,16 @@ async fn start(api_key: Option<&str>, engine: EngineConfig) -> String {
 }
 
 async fn start_with(dir: PathBuf, api_key: Option<&str>, engine: EngineConfig) -> String {
+    start_full(dir, api_key, engine, TruncationPolicy::Strict, false).await
+}
+
+async fn start_full(
+    dir: PathBuf,
+    api_key: Option<&str>,
+    engine: EngineConfig,
+    truncation: TruncationPolicy,
+    extended: bool,
+) -> String {
     let laya = Laya::load(&dir, &Device::Cpu, DType::F32).unwrap();
     let engine = Engine::new(Arc::new(laya), engine).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -52,7 +62,8 @@ async fn start_with(dir: PathBuf, api_key: Option<&str>, engine: EngineConfig) -
         description: "test".into(),
         release_date: "2026-09-25".into(),
         api_key: api_key.map(str::to_string),
-        extended: false,
+        extended,
+        truncation,
     };
     tokio::spawn(async move { axum::serve(listener, router(engine, cfg)).await.unwrap() });
     addr.to_string()
@@ -193,6 +204,83 @@ async fn systemone_matches_jev_shapes() {
     assert_eq!(status, 404);
     let (status, _, _) = call(&addr, "GET", "/v1/systemone", None, None).await;
     assert_eq!(status, 405);
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines()
+        .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+        .map(str::trim)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_inputs_are_answered_whole_or_refused() {
+    let words = |n: usize| {
+        (0..n)
+            .map(|i| format!("word{} ", i % 97))
+            .collect::<String>()
+    };
+    let addr = start(None, EngineConfig::default()).await;
+    // 255 options (Jev's limit) and a state several windows long: answered, nothing cut.
+    let crit: serde_json::Map<String, Value> = (0..255)
+        .map(|i| (format!("opt{i}"), json!(format!("category {i}"))))
+        .collect();
+    let body = json!({"state": words(200), "model": "m", "questions": {
+        "cat": {"type": "choice", "instructions": "Which category?", "criteria": crit},
+        "yes": {"type": "noul", "instructions": "Is it about refunds?"}}});
+    let (status, head, r) = call(
+        &addr,
+        "POST",
+        "/v1/systemone",
+        Some(&body.to_string()),
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(
+        r["answers"]["cat"]["probabilities"]
+            .as_object()
+            .unwrap()
+            .len(),
+        255
+    );
+    assert!(
+        header(&head, "x-state-chunks")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+            > 1
+    );
+    assert_eq!(header(&head, "x-truncated-questions"), Some("0"));
+
+    // A question too long for the encoder's positions is refused by default...
+    let body = json!({"state": "hi", "model": "m", "questions": {
+        "q": {"type": "noul", "instructions": words(700)}}})
+    .to_string();
+    let (status, _, e) = call(&addr, "POST", "/v1/systemone", Some(&body), None).await;
+    assert_eq!(status, 422);
+    assert_eq!(e["detail"][0]["type"], "too_long");
+    assert_eq!(
+        e["detail"][0]["loc"],
+        json!(["body", "questions", "q", "noul", "instructions"])
+    );
+    // ...and cut and counted with --truncation report.
+    let addr = start_full(
+        fixture(false),
+        None,
+        EngineConfig::default(),
+        TruncationPolicy::Report,
+        true,
+    )
+    .await;
+    let (status, head, r) = call(&addr, "POST", "/v1/systemone", Some(&body), None).await;
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(header(&head, "x-truncated-questions"), Some("1"));
+    assert!(
+        r["answers"]["q"]["truncated"]["instructions_tokens"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

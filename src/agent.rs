@@ -16,6 +16,7 @@ use crate::config::{clamp_temperature, AgentConfig, EncoderConfig};
 use crate::head::DecisionHead;
 use crate::model::{DecisionModel, Layout};
 use crate::modernbert::ModernBert;
+use crate::pipeline::{Budget, Plan};
 use crate::sequence::{
     build_prefix_sequence, build_sequence, build_state_prefix, encode_state, Criteria, Encoded,
     QType, Question, Specials,
@@ -130,31 +131,13 @@ impl Laya {
             .collect()
     }
 
-    /// One forward over all rows of a request. In the prefix layout the shared state is
-    /// encoded once; otherwise every row goes through one padded batch.
+    /// One forward over all rows of a request. In the prefix layout each run of rows sharing
+    /// a state prefix encodes it once; otherwise every row goes through one padded batch.
     pub fn forward(&self, rows: &[Encoded]) -> Result<Vec<RowOutput>> {
         if rows.is_empty() {
             return Ok(vec![]);
         }
-        let pad = self.specials.pad;
-        let out = match self.model.layout {
-            Layout::Prefix => self.model.forward_prefix(rows, pad, &self.device)?,
-            Layout::Laya => {
-                let batch = self.model.batch(rows, pad, &self.device)?;
-                self.model.forward(&batch, false)?
-            }
-        };
-        let logits = out.logits.to_vec2::<f32>()?;
-        let act = candle_nn::ops::softmax_last_dim(&out.act_logits)?.to_vec2::<f32>()?;
-        Ok(rows
-            .iter()
-            .zip(logits)
-            .zip(act)
-            .map(|((r, l), a)| RowOutput {
-                logits: l[..r.markers.len()].to_vec(),
-                act_probs: a,
-            })
-            .collect())
+        Ok(self.forward_many(&[rows])?.remove(0))
     }
 
     /// Several requests in one forward: each group is one request's rows (from
@@ -166,7 +149,12 @@ impl Laya {
             return Ok(groups.iter().map(|_| vec![]).collect());
         }
         let pad = self.specials.pad;
-        let nonempty: Vec<&[Encoded]> = groups.iter().copied().filter(|g| !g.is_empty()).collect();
+        // Prefix layout: a request whose state runs in chunks has one prefix per chunk, so
+        // split its rows into runs that share one.
+        let nonempty: Vec<&[Encoded]> = groups
+            .iter()
+            .flat_map(|g| g.chunk_by(|a, b| a.ids[..a.prefix_len] == b.ids[..b.prefix_len]))
+            .collect();
         let out = match self.model.layout {
             Layout::Prefix => self
                 .model
@@ -215,11 +203,11 @@ impl Laya {
             .iter()
             .map(|(id, q)| Question::from_json(q).with_context(|| format!("question {id:?}")))
             .collect::<Result<Vec<_>>>()?;
-        let rows = self.encode(state, &parsed)?;
-        let outs = self.forward(&rows)?;
+        let plan = Plan::new(self, &Budget::for_model(self), state, parsed)?;
+        let (outs, _) = plan.run(|rows| self.forward(&rows))?;
         let mut answers = Map::new();
-        for ((id, q), out) in questions.keys().zip(&parsed).zip(outs) {
-            answers.insert(id.clone(), self.decode(q, &out));
+        for (id, (q, out)) in questions.keys().zip(outs) {
+            answers.insert(id.clone(), self.decode(&q, &out));
         }
         Ok(Value::Object(answers))
     }
