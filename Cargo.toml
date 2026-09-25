@@ -8,12 +8,16 @@ repository = "https://github.com/cyrup-ai/candle-rlcd"
 
 [dependencies]
 anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json", "query"] }
 candle-core = "0.11"
 candle-nn = "0.11"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
+crossbeam-channel = "0.5"
+rayon = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "signal", "time", "io-util"] }
 
 [dev-dependencies]
 approx = "0.5"

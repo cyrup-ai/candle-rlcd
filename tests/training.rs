@@ -310,3 +310,51 @@ fn train_checkpoint_resume_and_load() {
     assert!(out["team"]["choice"].is_string());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn batched_requests_match_one_at_a_time() {
+    // Several requests (different states, different lengths, different question sets) in one
+    // left-padded forward give each request what it gets alone. The fixture's 16-token sliding
+    // window makes this sensitive to any position shift from the padding.
+    let (agent, _vm) = trainable(Layout::Prefix);
+    let qs = questions();
+    let states = [
+        json!("Short note: refund please."),
+        state(),
+        json!({"ticket": 7, "body": "The app crashes on login every morning since the last update, and support has not answered in a week. I am cancelling unless this is fixed today.", "plan": "pro"}),
+    ];
+    let requests: Vec<Vec<candle_rlcd::sequence::Encoded>> = states
+        .iter()
+        .enumerate()
+        .map(|(i, s)| agent.encode(s, &qs[i % 3..]).unwrap())
+        .collect();
+    let groups: Vec<&[candle_rlcd::sequence::Encoded]> =
+        requests.iter().map(|r| r.as_slice()).collect();
+    let (pad, dev) = (agent.specials.pad, agent.device());
+    let batched = agent
+        .model
+        .forward_prefix_groups(&groups, pad, dev)
+        .unwrap();
+    let logits = batched.logits.to_vec2::<f32>().unwrap();
+    let act = batched.act_logits.to_vec2::<f32>().unwrap();
+    let mut row = 0;
+    for rows in &requests {
+        let alone = agent.model.forward_prefix(rows, pad, dev).unwrap();
+        let (l1, a1) = (
+            alone.logits.to_vec2::<f32>().unwrap(),
+            alone.act_logits.to_vec2::<f32>().unwrap(),
+        );
+        for (i, r) in rows.iter().enumerate() {
+            let k = r.markers.len();
+            for j in 0..k {
+                let d = (l1[i][j] - logits[row][j]).abs();
+                assert!(d < 1e-4, "request row {i} option {j}: {d}");
+            }
+            for j in 0..a1[i].len() {
+                assert!((a1[i][j] - act[row][j]).abs() < 1e-4);
+            }
+            row += 1;
+        }
+    }
+    assert_eq!(row, logits.len());
+}
