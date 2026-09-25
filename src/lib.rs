@@ -6,10 +6,13 @@
 pub mod agent;
 pub mod autograd;
 pub mod bench;
+pub mod calibrate;
 pub mod config;
 pub mod data;
 pub mod head;
+pub mod hub;
 pub mod loss;
+pub mod metrics;
 pub mod model;
 pub mod modernbert;
 pub mod optim;

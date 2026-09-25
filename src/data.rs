@@ -9,6 +9,18 @@
 //!
 //! A target is an option key (`"b"`, `"true"`, `"2"`), an index, a boolean (`noul`), a
 //! probability of `true` (`noul`), a list of per-option probabilities, or a `{key: prob}` map.
+//!
+//! Records can also be in Jev's shape: a `/v1/systemone` request body (`type`, `instructions`,
+//! `criteria`; `model` is ignored) with `targets`, or with the `answers` of a response you
+//! accepted, whose answer objects are read as targets (`probabilities` when present, else the
+//! `choice`, the `noul` probability or the rounded `score`):
+//!
+//! ```json
+//! {"state": "Help! My payouts have been failing for 3 days.", "model": "jev-latest",
+//!  "questions": {"team": {"type": "choice", "instructions": "Which team?",
+//!                         "criteria": {"billing": "Payments", "technical": null}}},
+//!  "answers": {"team": {"type": "choice", "choice": "billing"}}}
+//! ```
 
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -80,8 +92,9 @@ pub fn record_examples(rec: &Value) -> Result<Vec<Example>> {
         .context("record needs a \"questions\" object")?;
     let targets = rec
         .get("targets")
+        .or_else(|| rec.get("answers"))
         .and_then(Value::as_object)
-        .context("record needs a \"targets\" object")?;
+        .context("record needs a \"targets\" (or Jev \"answers\") object")?;
     let mut out = Vec::new();
     for (id, qv) in qs {
         let Some(tv) = targets.get(id) else { continue };
@@ -133,6 +146,9 @@ pub fn parse_target(q: &Question, v: &Value) -> Result<Vec<f32>> {
                 })
                 .collect::<Result<Vec<_>>>()?
         }
+        Value::Object(m) if m.get("type").and_then(Value::as_str) == Some(q.t.name()) => {
+            return jev_answer_target(q, m);
+        }
         Value::Object(m) => {
             let mut t = vec![0f32; k];
             for (key, p) in m {
@@ -152,6 +168,27 @@ pub fn parse_target(q: &Question, v: &Value) -> Result<Vec<f32>> {
         "target must be a non-negative distribution"
     );
     Ok(t.into_iter().map(|x| x / s).collect())
+}
+
+/// A Jev answer object (`{"type": "choice", "choice": .., "probabilities": ..}` and so on)
+/// read as a target.
+fn jev_answer_target(q: &Question, m: &Map<String, Value>) -> Result<Vec<f32>> {
+    if let Some(p) = m.get("probabilities").filter(|p| p.is_object()) {
+        return parse_target(q, p);
+    }
+    let field = q.t.name();
+    let v = m
+        .get(field)
+        .with_context(|| format!("a {field} answer needs \"{field}\" or \"probabilities\""))?;
+    match (q.t, v) {
+        (QType::Score, Value::Number(n)) => {
+            let s = n.as_f64().context("score must be a number")?;
+            ensure!(s >= 0.0, "score must be non-negative");
+            parse_target(q, &json!(s.round() as u64))
+        }
+        (QType::Noul, Value::Number(n)) => parse_target(q, &json!(n.as_f64().unwrap_or(0.0))),
+        _ => parse_target(q, v),
+    }
 }
 
 /// Anti-shortcut augmentation (spec §7.6), applied per example per epoch.
@@ -512,6 +549,36 @@ mod tests {
         let n = Question::from_json(&json!({"t": "noul", "ins": "x"})).unwrap();
         assert_eq!(parse_target(&n, &json!(true)).unwrap(), vec![0.0, 1.0]);
         assert_eq!(parse_target(&n, &json!(0.25)).unwrap(), vec![0.75, 0.25]);
+    }
+
+    #[test]
+    fn jev_shaped_records_and_answers() {
+        // A /v1/systemone request with the answers of an accepted response.
+        let rec = json!({
+            "state": "Help! My payouts have been failing for 3 days.", "model": "jev-latest",
+            "questions": {
+                "team": {"type": "choice", "instructions": null,
+                         "criteria": {"billing": "Payments", "technical": null}},
+                "urgent": {"type": "noul", "instructions": "Is it urgent?"},
+                "anger": {"type": "score", "instructions": "How angry?",
+                          "criteria": ["calm", "annoyed", "furious"]},
+                "soft": {"type": "choice", "instructions": "x", "criteria": {"a": null, "b": null}},
+            },
+            "answers": {
+                "team": {"type": "choice", "choice": "billing", "confidence": 0.9},
+                "urgent": {"type": "noul", "noul": 0.8},
+                "anger": {"type": "score", "score": 1.4, "legend": {}},
+                "soft": {"type": "choice", "choice": "a", "probabilities": {"a": 0.6, "b": 0.4}},
+            },
+        });
+        let exs = record_examples(&rec).unwrap();
+        let t: Vec<Vec<f32>> = exs.iter().map(|e| e.target.clone()).collect();
+        assert_eq!(t[0], vec![1.0, 0.0]);
+        assert!((t[1][1] - 0.8).abs() < 1e-6);
+        assert_eq!(t[2], vec![0.0, 1.0, 0.0]);
+        assert_eq!(t[3], vec![0.6, 0.4]);
+        // null instructions are empty, as the server renders them.
+        assert_eq!(exs[0].question.ins, "");
     }
 
     #[test]

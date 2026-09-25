@@ -9,12 +9,41 @@ laya is the reference, not the target. Training uses a direct proper-scoring los
 laya's REINFORCE term, and a new *prefix* layout encodes the state once per request instead of
 once per question. `candle-rlcd serve` exposes it over HTTP with TypeSafe's Jev API.
 
+## Install
+
+- **Prebuilt binaries** for Linux x86_64 and arm64 and for Apple Silicon (built with Metal and
+  Accelerate) are attached to each [GitHub release](https://github.com/cyrup-ai/candle-rlcd/releases).
+  Pushing a `v*` tag builds them (`.github/workflows/release.yml`).
+- **Docker** (CPU): `docker run -p 8080:8080 -v candle-rlcd:/data ghcr.io/cyrup-ai/candle-rlcd`
+  serves laya on port 8080. Weights download to the `/data` volume on first start.
+- **From source**: `cargo build --release`, adding `--features cuda`, `metal`, `mkl` or
+  `accelerate` as available.
+
+```sh
+candle-rlcd serve                    # downloads convaiinnovations/laya on first run, then serves it
+```
+
 ## Use
 
 ```sh
-cargo run --release -- run --model /path/to/laya --request request.json          # CPU, f32
+cargo run --release -- run --request request.json                     # laya from the Hub, CPU, f32
+cargo run --release -- run --model /path/to/checkpoint < request.json
 cargo run --release --features cuda -- run --model /path/to/laya --dtype bf16 < request.json
 ```
+
+`--model` takes a checkpoint directory or a Hub id. It defaults to `convaiinnovations/laya`.
+
+| `--model` | what |
+|---|---|
+| `runs/x/final` | a local checkpoint directory |
+| `convaiinnovations/laya` | a Hub repository's root checkpoint |
+| `convaiinnovations/laya/multilingual` | a checkpoint in a sub-folder (laya also has `typed-decisions`) |
+| `convaiinnovations/laya@55cf4c4e…` | pinned to a branch, tag or commit |
+
+Hub checkpoints download once into the Hugging Face cache (`HF_HOME`, `HF_HUB_CACHE`) in its
+usual layout, so an earlier `huggingface-cli download` is reused. Only the files a checkpoint
+needs are fetched: 803 MB for laya's root, not the whole 2.4 GB repository. `HF_HUB_OFFLINE=1`
+uses the cache without the network, and `HF_TOKEN` is sent for private repositories.
 
 ```json
 {"state": "Customer says the package arrived damaged and wants a refund.",
@@ -29,12 +58,13 @@ The output matches laya's `system_one` answers: `choice` / `score` / `noul`, cal
 the act head's `act_probability`.
 
 A checkpoint directory holds `rl_agent_config.json`, `model.safetensors`, `encoder/config.json`
-and `tokenizer/` (the Hub layout; `huggingface-cli download convaiinnovations/laya` fetches it).
+and `tokenizer/`, which is the Hub layout.
 
 ## Serve: a local Jev API
 
 ```sh
 cargo build --release          # add --features cuda / metal / mkl / accelerate as available
+./target/release/candle-rlcd serve --port 8080                          # laya from the Hub
 ./target/release/candle-rlcd serve --model /path/to/model --port 8080
 ```
 
@@ -47,6 +77,7 @@ response and error types, taken from TypeSafe's published OpenAPI schema
 | `POST /v1/systemone` | `{"state", "model", "questions": {id: {"type": "choice" \| "score" \| "noul", "instructions", "criteria"}}}` to `{"model", "answers": {id: answer}, "usage"}` |
 | `GET /v1/models` | `{"models": [{"name", "description", "release_date"}]}`: the served model plus the `jev-latest` / `jev-preview` aliases |
 | `GET /health` | not in Jev: status, engine settings and request/batch counters |
+| `GET /metrics` | not in Jev: Prometheus metrics (see below) |
 
 Answers carry exactly Jev's fields. A `choice` has `choice`, `probabilities` and
 `confidence`; a `score` has `score` (the expected level), `legend`, `probabilities` and
@@ -70,8 +101,8 @@ This was checked with `typesafe-sdk` 0.7.1: listing models, all three question t
 error all go through the SDK.
 
 Where it differs from Jev:
-- **`model`**: any name is accepted, and the response reports the served model's name (the
-  directory name, or `--model-name`). There is one model per server.
+- **`model`**: the response reports the served model's name, not a Jev version. With one
+  model, any name is accepted. With several (below), `model` picks one.
 - **`confidence`**: Jev's docs give `(k * max p - 1) / (k - 1)` for Choice, and that is what
   is returned. The Score formula isn't published. The same formula reproduces TypeSafe's
   3-level Score examples, but not their 4- and 5-level ones, so Score confidence may differ.
@@ -81,6 +112,63 @@ Where it differs from Jev:
   truncated the way laya does it, so conversations keep their newest turns.
 - **Limits**: at most 255 Choice options and 10 Score levels, per Jev's docs.
 - `--extended` adds laya's `answer_confidence` (max p) and `act_probability` to each answer.
+- `--max-questions N` refuses requests with more than N questions with a 422. Jev has no such
+  cap. It stops one request from holding a worker for a long time.
+
+### Several models
+
+Repeat `--model` to serve several checkpoints from one process, and use `name=` to choose the
+names requests use:
+
+```sh
+candle-rlcd serve --model laya=convaiinnovations/laya \
+                  --model laya-multilingual=convaiinnovations/laya/multilingual \
+                  --model support=runs/support/final
+```
+
+- A request's `model` picks the checkpoint by name.
+- The first model is the default, and it answers `jev-latest` and `jev-preview`.
+- An unknown name gets a 422 at `body.model` that lists the served names.
+- A Hub model also answers a pinned name such as `laya@55cf4c4`, so a client can hold on to
+  one exact version.
+- `/v1/models` lists every name.
+- Each model gets its own workers. They share one count of running passes, so the adaptive
+  width sees the load across all models.
+
+### Metrics
+
+`GET /metrics` serves Prometheus text. It needs no API key, like `/health`. It reports:
+
+- HTTP responses by route and status, and latency histograms by route.
+- Per model: queue depth, workers, requests, forward passes, rows, questions answered and input
+  tokens.
+- Forward-pass time and queue-wait histograms.
+- The number of passes running now.
+
+### Calibrating confidence on your data
+
+Confidence-gated routing means acting on an answer when `confidence` is high and escalating
+it otherwise. That only works if confidence means what it says on your traffic. laya's shipped
+temperatures were fit on its own data. `calibrate` refits them from your labelled requests
+without touching the weights:
+
+```sh
+candle-rlcd calibrate --data labelled.jsonl --out cal.json   # labelled Jev requests, see below
+candle-rlcd serve --calibration cal.json                     # or name=cal.json with several models
+```
+
+- It fits on a random half and prints accuracy, NLL, Brier and ECE on the other half, raw,
+  with the current temperatures and with the new ones. Then it refits on everything.
+- A `(type, option-count)` bucket gets its own temperature only with at least
+  `--min-examples` (30) questions. A type with enough data gets a new fallback temperature,
+  and its old bucket temperatures are dropped.
+- `run`, `eval` and `bench` take `--calibration` too. `--write` stores the result in a local
+  checkpoint's `rl_agent_config.json` and keeps the original next to it.
+
+Shipped temperatures never sharpen 11 or more options. laya's root config sets `choice:11+` to
+0.1, fit on few examples, and even after the [0.5, 5] clamp that pushed an unanswerable 11-option
+question's max p from 0.135 (at 10 options) to 0.213. Unless `calibrate` or `train` refit the
+temperatures, 11+ options now use at least 1.0, which gives 0.145.
 
 ### Concurrency
 
@@ -211,8 +299,9 @@ candle-rlcd data ag-news --input ag_news_csv/test.csv  --output test.jsonl
 candle-rlcd train --train train.jsonl --eval test.jsonl --out runs/ag \
     --init-encoder ModernBERT-base --epochs 1 --batch-size 16 --grad-accum 4
 
-# ...or from a laya snapshot (every matching tensor is loaded, laya's layout or the prefix one)
-candle-rlcd train --train train.jsonl --eval test.jsonl --out runs/ag --init laya
+# ...or from a laya checkpoint, a directory or a Hub id (every matching tensor is loaded, laya's
+# layout or the prefix one)
+candle-rlcd train --train train.jsonl --eval test.jsonl --out runs/ag --init convaiinnovations/laya
 
 candle-rlcd eval --model runs/ag/final --data test.jsonl
 candle-rlcd run  --model runs/ag/final --request request.json
@@ -222,6 +311,34 @@ Records are JSONL, one state with any number of questions:
 `{"state": .., "questions": {id: {"t", "ins", "crit"}}, "targets": {id: target}}`, where a
 target is an option key, an index, a boolean or `p(true)` for `noul`, a list of per-option
 probabilities, or a `{key: prob}` map (teacher soft labels).
+
+**Your own decisions, in Jev's shape.** A record can also be a `/v1/systemone` request body
+(`type` / `instructions` / `criteria`; `model` is ignored) plus `targets`. It can also carry
+the `answers` of a response you accepted or corrected, and each Jev answer object is read as
+the target:
+
+- `probabilities` when present, as soft labels;
+- otherwise the `choice`, the `noul` probability, or the `score` rounded to a level.
+
+So a log of requests and the answers you acted on is training data as it stands, for `train`,
+`eval` and `calibrate` alike. [`examples/jev-labelled.jsonl`](examples/jev-labelled.jsonl) shows
+all three forms:
+
+```json
+{"state": "How do I change the email on my account?", "model": "jev-latest",
+ "questions": {"team": {"type": "choice", "instructions": "Which team should handle this ticket?",
+                        "criteria": {"billing": "Payments", "technical": "Bugs", "account": "Login and settings"}}},
+ "answers": {"team": {"type": "choice", "choice": "account"}}}
+```
+
+Instructions and criteria are rendered exactly as the server renders them, so a model trained
+on these records sees at serving time what it saw in training. To specialise laya on them,
+fine-tune from it and then serve the result:
+
+```sh
+candle-rlcd train --train decisions.jsonl --eval held-out.jsonl --out runs/mine --init convaiinnovations/laya
+candle-rlcd serve --model mine=runs/mine/final --model laya=convaiinnovations/laya
+```
 
 **Default data: AG News.** laya's base data mix isn't published. AG News is small (120k/7.6k),
 openly downloadable without Hugging Face (the original CSV release, mirrored on GitHub), and is in
