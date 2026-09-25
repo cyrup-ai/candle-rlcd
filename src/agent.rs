@@ -273,8 +273,14 @@ pub fn build_model(
     encoder_cfg: &EncoderConfig,
 ) -> Result<DecisionModel> {
     let encoder = ModernBert::load(vb.pp("encoder"), encoder_cfg).context("loading encoder")?;
-    let head = DecisionHead::load(vb, encoder_cfg.hidden_size, cfg.head_layers, cfg.n_act())
-        .context("loading decision head")?;
+    let head = DecisionHead::load(
+        vb,
+        encoder_cfg.hidden_size,
+        cfg.head_layers,
+        cfg.n_act(),
+        encoder_cfg.initializer_range,
+    )
+    .context("loading decision head")?;
     Ok(DecisionModel {
         encoder,
         head,

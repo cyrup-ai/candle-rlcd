@@ -40,17 +40,17 @@ struct HeadLayer {
 }
 
 impl HeadLayer {
-    fn load(vb: VarBuilder, d: usize) -> Result<Self> {
+    fn load(vb: VarBuilder, d: usize, std: f64) -> Result<Self> {
         let sa = vb.pp("self_attn");
         let in_proj = Linear::new(
-            sa.get_with_hints((3 * d, d), "in_proj_weight", init_normal())?,
+            sa.get_with_hints((3 * d, d), "in_proj_weight", init_normal(std))?,
             Some(sa.get_with_hints(3 * d, "in_proj_bias", Init::Const(0.0))?),
         );
         Ok(Self {
             in_proj,
-            out_proj: linear(sa.pp("out_proj"), d, d, true)?,
-            linear1: linear(vb.pp("linear1"), d, 4 * d, true)?,
-            linear2: linear(vb.pp("linear2"), 4 * d, d, true)?,
+            out_proj: linear(sa.pp("out_proj"), d, d, true, std)?,
+            linear1: linear(vb.pp("linear1"), d, 4 * d, true, std)?,
+            linear2: linear(vb.pp("linear2"), 4 * d, d, true, std)?,
             // PyTorch LayerNorm default eps.
             norm1: Norm::load(vb.pp("norm1"), d, 1e-5, true)?,
             norm2: Norm::load(vb.pp("norm2"), d, 1e-5, true)?,
@@ -139,23 +139,30 @@ pub struct HeadInputs {
 }
 
 impl DecisionHead {
-    pub fn load(vb: VarBuilder, d: usize, head_layers: usize, n_act: usize) -> Result<Self> {
+    /// `std`: init scale for weights created rather than loaded.
+    pub fn load(
+        vb: VarBuilder,
+        d: usize,
+        head_layers: usize,
+        n_act: usize,
+        std: f64,
+    ) -> Result<Self> {
         let layers = (0..head_layers)
-            .map(|i| HeadLayer::load(vb.pp(format!("head.layers.{i}")), d))
+            .map(|i| HeadLayer::load(vb.pp(format!("head.layers.{i}")), d, std))
             .collect::<Result<Vec<_>>>()?;
         let temperature = vb.get_with_hints(3, "temperature", Init::Const(1.0)).ok();
         Ok(Self {
             type_emb: Embedding::new(
                 vb.pp("type_emb")
-                    .get_with_hints((3, d), "weight", init_normal())?,
+                    .get_with_hints((3, d), "weight", init_normal(std))?,
                 d,
             ),
             layers,
             scorer_norm: Norm::load(vb.pp("scorer.0"), d, 1e-5, true)?,
-            scorer_fc: linear(vb.pp("scorer.1"), d, d, true)?,
-            scorer_out: linear(vb.pp("scorer.3"), d, 1, true)?,
-            act_fc: linear(vb.pp("act_head.0"), d + 4, 256, true)?,
-            act_out: linear(vb.pp("act_head.2"), 256, n_act, true)?,
+            scorer_fc: linear(vb.pp("scorer.1"), d, d, true, std)?,
+            scorer_out: linear(vb.pp("scorer.3"), d, 1, true, std)?,
+            act_fc: linear(vb.pp("act_head.0"), d + 4, 256, true, std)?,
+            act_out: linear(vb.pp("act_head.2"), 256, n_act, true, std)?,
             temperature,
         })
     }

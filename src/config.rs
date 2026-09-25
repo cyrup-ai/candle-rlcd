@@ -32,6 +32,8 @@ pub struct EncoderConfig {
     /// Per-layer sliding-window flag (transformers 5 `layer_types`, else every layer not a
     /// multiple of `global_attn_every_n_layers`).
     pub local_layers: Vec<bool>,
+    /// Std of the N(0, σ²) init for weights trained from scratch (HF default 0.02).
+    pub initializer_range: f64,
 }
 
 #[derive(Deserialize)]
@@ -62,6 +64,7 @@ struct RawEncoderConfig {
     rope_parameters: Option<Value>,
     layer_types: Option<Vec<String>>,
     hidden_activation: Option<String>,
+    initializer_range: Option<f64>,
 }
 
 fn default_max_pos() -> usize {
@@ -138,6 +141,7 @@ impl EncoderConfig {
             global_rope_theta: global,
             local_rope_theta: local,
             local_attention: raw.local_attention,
+            initializer_range: raw.initializer_range.unwrap_or(0.02),
         })
     }
 

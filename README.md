@@ -157,7 +157,14 @@ inference encodes the state once and runs each question as a short suffix agains
 It has exactly laya's parameters, so a laya snapshot is a valid starting point (`--init laya`);
 training runs the ordinary masked forward, and `tests/training.rs` checks it equals the cached
 path. `cargo run --release --example encode_once` times both layouts on a ModernBERT-base-shaped
-model.
+model (random weights, 512 tokens, 4-core CPU container, f32):
+
+| questions per request | laya layout | prefix layout | speedup |
+|---|---|---|---|
+| 1 | 1597 ms | 1118 ms | 1.4x |
+| 2 | 2960 ms | 1549 ms | 1.9x |
+| 4 | 6141 ms | 1852 ms | 3.3x |
+| 8 | 12445 ms | 3186 ms | 3.9x |
 
 ### Candle fixes for training
 
@@ -165,10 +172,16 @@ model.
   `autograd::rope` keeps the fused kernel and adds the backward (the inverse rotation);
   `autograd::softmax_last_dim` does the same for the fused softmax. Both are no-ops for
   inference. The fused layer norm switches to Candle's differentiable composite when training.
-- Fresh weights get ModernBERT's init (norms 1/0, embeddings and linears N(0, 0.02)).
+- Fresh weights get ModernBERT's init (norms 1/0, embeddings and linears N(0, σ²) with σ the
+  config's `initializer_range`, default 0.02).
 - `tests/training.rs` checks every parameter on the scoring path gets a gradient (including
   the Q/K rows of every `Wqkv`) and that gradients match finite differences.
 
 Not done yet: mixed precision/loss scaling, gradient checkpointing and multi-GPU all-reduce. CPU
 training works but is slow (Candle's CPU ops are mostly single-threaded at these sizes); use
 `--features cuda` for real runs.
+
+Start from pretrained weights. Small models trained from scratch learn `score` questions quickly,
+but they stay at chance on option matching like AG News for hundreds of steps. Every option marker
+is the same `[MASK]` token, and a fresh model's attention is near uniform, so the markers start
+out indistinguishable. A pretrained encoder has already mixed each option's text into its marker.

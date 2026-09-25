@@ -66,18 +66,23 @@ impl Module for Norm {
     }
 }
 
-/// ModernBERT's `initializer_range`; only used when a weight is created rather than loaded.
-pub(crate) const INIT_STD: f64 = 0.02;
-
-pub(crate) fn init_normal() -> Init {
+/// N(0, std²) init (the config's `initializer_range`); only used when a weight is created
+/// rather than loaded.
+pub(crate) fn init_normal(std: f64) -> Init {
     Init::Randn {
         mean: 0.0,
-        stdev: INIT_STD,
+        stdev: std,
     }
 }
 
-pub(crate) fn linear(vb: VarBuilder, in_dim: usize, out_dim: usize, bias: bool) -> Result<Linear> {
-    let w = vb.get_with_hints((out_dim, in_dim), "weight", init_normal())?;
+pub(crate) fn linear(
+    vb: VarBuilder,
+    in_dim: usize,
+    out_dim: usize,
+    bias: bool,
+    std: f64,
+) -> Result<Linear> {
+    let w = vb.get_with_hints((out_dim, in_dim), "weight", init_normal(std))?;
     let b = if bias {
         Some(vb.get_with_hints(out_dim, "bias", Init::Const(0.0))?)
     } else {
@@ -165,8 +170,14 @@ impl Attention {
     fn load(vb: VarBuilder, cfg: &EncoderConfig) -> Result<Self> {
         let d = cfg.hidden_size;
         Ok(Self {
-            wqkv: linear(vb.pp("Wqkv"), d, 3 * d, cfg.attention_bias)?,
-            wo: linear(vb.pp("Wo"), d, d, cfg.attention_bias)?,
+            wqkv: linear(
+                vb.pp("Wqkv"),
+                d,
+                3 * d,
+                cfg.attention_bias,
+                cfg.initializer_range,
+            )?,
+            wo: linear(vb.pp("Wo"), d, d, cfg.attention_bias, cfg.initializer_range)?,
             heads: cfg.num_attention_heads,
             head_dim: cfg.head_dim(),
         })
@@ -217,8 +228,8 @@ impl Mlp {
     fn load(vb: VarBuilder, cfg: &EncoderConfig) -> Result<Self> {
         let (d, f) = (cfg.hidden_size, cfg.intermediate_size);
         Ok(Self {
-            wi: linear(vb.pp("Wi"), d, 2 * f, cfg.mlp_bias)?,
-            wo: linear(vb.pp("Wo"), f, d, cfg.mlp_bias)?,
+            wi: linear(vb.pp("Wi"), d, 2 * f, cfg.mlp_bias, cfg.initializer_range)?,
+            wo: linear(vb.pp("Wo"), f, d, cfg.mlp_bias, cfg.initializer_range)?,
         })
     }
 }
@@ -401,7 +412,7 @@ impl ModernBert {
             vb.pp("embeddings.tok_embeddings").get_with_hints(
                 (cfg.vocab_size, d),
                 "weight",
-                init_normal(),
+                init_normal(cfg.initializer_range),
             )?,
             d,
         );
