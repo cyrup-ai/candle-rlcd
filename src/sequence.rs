@@ -54,18 +54,20 @@ pub enum Criteria {
 impl Question {
     pub fn from_json(v: &Value) -> Result<Self> {
         let o = v.as_object().context("question must be an object")?;
-        let t = match o.get("t").and_then(Value::as_str) {
+        // laya's short keys (`t` / `ins` / `crit`) or Jev's (`type` / `instructions` / `criteria`).
+        let field = |short: &str, long: &str| o.get(short).or_else(|| o.get(long));
+        let t = match field("t", "type").and_then(Value::as_str) {
             Some("choice") => QType::Choice,
             Some("score") => QType::Score,
             Some("noul") => QType::Noul,
             other => bail!("unknown question type {other:?}"),
         };
-        let ins = match o.get("ins") {
+        let ins = match field("ins", "instructions") {
             Some(Value::String(s)) => s.clone(),
             Some(v) => python_str(v),
             None => String::new(),
         };
-        let crit = o.get("crit").cloned().unwrap_or(Value::Null);
+        let crit = field("crit", "criteria").cloned().unwrap_or(Value::Null);
         ensure!(
             t == QType::Noul || !o.contains_key("labels"),
             "labels is only supported for noul questions"

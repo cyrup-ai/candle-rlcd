@@ -157,6 +157,45 @@ impl Laya {
             .collect())
     }
 
+    /// Several requests in one forward: each group is one request's rows (from
+    /// [`Self::encode`]). In the prefix layout the states are encoded together, left-padded
+    /// ([`DecisionModel::forward_prefix_groups`]); in laya's layout all rows form one padded
+    /// batch. Padding is masked, so each request gets what it would alone.
+    pub fn forward_many(&self, groups: &[&[Encoded]]) -> Result<Vec<Vec<RowOutput>>> {
+        if groups.iter().all(|g| g.is_empty()) {
+            return Ok(groups.iter().map(|_| vec![]).collect());
+        }
+        let pad = self.specials.pad;
+        let nonempty: Vec<&[Encoded]> = groups.iter().copied().filter(|g| !g.is_empty()).collect();
+        let out = match self.model.layout {
+            Layout::Prefix => self
+                .model
+                .forward_prefix_groups(&nonempty, pad, &self.device)?,
+            Layout::Laya => {
+                let rows: Vec<Encoded> = nonempty.iter().flat_map(|g| g.iter().cloned()).collect();
+                let batch = self.model.batch(&rows, pad, &self.device)?;
+                self.model.forward(&batch, false)?
+            }
+        };
+        let logits = out.logits.to_vec2::<f32>()?;
+        let act = candle_nn::ops::softmax_last_dim(&out.act_logits)?.to_vec2::<f32>()?;
+        let mut flat = logits.into_iter().zip(act);
+        Ok(groups
+            .iter()
+            .map(|g| {
+                g.iter()
+                    .map(|r| {
+                        let (l, a) = flat.next().expect("one output row per input row");
+                        RowOutput {
+                            logits: l[..r.markers.len()].to_vec(),
+                            act_probs: a,
+                        }
+                    })
+                    .collect()
+            })
+            .collect())
+    }
+
     /// Fitted temperature for a question type and option count, clamped to [0.5, 5].
     pub fn temperature(&self, qtype: QType, k: usize) -> f64 {
         let key = temperature_key(qtype, k);
@@ -183,6 +222,12 @@ impl Laya {
             answers.insert(id.clone(), self.decode(q, &out));
         }
         Ok(Value::Object(answers))
+    }
+
+    /// Calibrated probabilities for one row: softmax at the fitted temperature.
+    pub fn probabilities(&self, q: &Question, out: &RowOutput) -> Vec<f32> {
+        let temp = self.temperature(q.t, out.logits.len()) as f32;
+        softmax(&out.logits, temp)
     }
 
     /// Turn one row's logits into a typed answer, with calibrated probabilities.
@@ -312,6 +357,6 @@ fn entropy_confidence(p: &[f32]) -> f64 {
     round4((1.0 - h / (k as f64).ln()).clamp(0.0, 1.0))
 }
 
-fn round4(x: f64) -> f64 {
+pub(crate) fn round4(x: f64) -> f64 {
     (x * 1e4).round() / 1e4
 }

@@ -141,7 +141,7 @@ pub(crate) fn attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Re
     att.matmul(&v.contiguous()?)
 }
 
-/// Keys and values of a cached prefix for one layer, `[1, h, t, hd]`.
+/// Keys and values of a cached prefix for one layer, `[g, h, t, hd]` (one row per state).
 #[derive(Clone, Debug)]
 pub struct Kv {
     pub k: Tensor,
@@ -149,12 +149,25 @@ pub struct Kv {
 }
 
 impl Kv {
+    /// Keys/values for a batch of `b` query rows: a cache with one row is broadcast to all of
+    /// them, and a cache with `b` rows (one per query row, see [`Kv::select`]) is used as is.
     pub(crate) fn expand(&self, b: usize) -> Result<(Tensor, Tensor)> {
+        if self.k.dim(0)? == b {
+            return Ok((self.k.clone(), self.v.clone()));
+        }
         let grow = |x: &Tensor| -> Result<Tensor> {
             let (_, h, t, hd) = x.dims4()?;
             x.broadcast_as((b, h, t, hd))?.contiguous()
         };
         Ok((grow(&self.k)?, grow(&self.v)?))
+    }
+
+    /// Gathers cache rows so row `i` holds state `rows[i]`.
+    pub fn select(&self, rows: &Tensor) -> Result<Self> {
+        Ok(Self {
+            k: self.k.index_select(rows, 0)?,
+            v: self.v.index_select(rows, 0)?,
+        })
     }
 }
 
@@ -372,9 +385,58 @@ impl Masks {
             local: Tensor::from_vec(local, (b, 1, t_q, t_k), dev)?,
         })
     }
+
+    /// Masks for rows whose state is left-padded to `p_max` tokens, so every state ends at the
+    /// same position and question tokens start at `p_max` in every row. Row `r`'s state is keys
+    /// `pads[r]..p_max` and its question keys `p_max..p_max + sufs[r]`; queries sit at positions
+    /// `q_offset..q_offset + t_q`. State queries see only their state, question queries see
+    /// their state and question. RoPE and the sliding window depend only on relative position,
+    /// so a left-padded row computes what it would alone. Padded state queries see only
+    /// themselves and padded question queries see the row's real keys, so no row is empty.
+    #[allow(clippy::too_many_arguments)]
+    pub fn left_padded(
+        pads: &[usize],
+        p_max: usize,
+        sufs: &[usize],
+        t_q: usize,
+        t_k: usize,
+        q_offset: usize,
+        half_window: usize,
+        dev: &Device,
+    ) -> Result<Self> {
+        let b = pads.len();
+        let mut global = vec![f32::MIN; b * t_q * t_k];
+        let mut local = vec![f32::MIN; b * t_q * t_k];
+        for r in 0..b {
+            for qi in 0..t_q {
+                let q = qi + q_offset;
+                for k in 0..t_k {
+                    let state_key = k >= pads[r] && k < p_max;
+                    let visible = if q < pads[r] {
+                        k == q
+                    } else if q < p_max {
+                        state_key
+                    } else {
+                        state_key || (k >= p_max && k < p_max + sufs[r])
+                    };
+                    if visible {
+                        let idx = (r * t_q + qi) * t_k + k;
+                        global[idx] = 0.0;
+                        if q.abs_diff(k) <= half_window {
+                            local[idx] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Self {
+            global: Tensor::from_vec(global, (b, 1, t_q, t_k), dev)?,
+            local: Tensor::from_vec(local, (b, 1, t_q, t_k), dev)?,
+        })
+    }
 }
 
-/// A state encoded once: per-layer keys/values and the final hidden state `[1, t, d]`.
+/// States encoded once: per-layer keys/values and the final hidden state `[g, t, d]`.
 #[derive(Clone, Debug)]
 pub struct PrefixCache {
     pub layers: Vec<Kv>,
@@ -457,7 +519,13 @@ impl ModernBert {
     pub fn encode_prefix(&self, input_ids: &Tensor) -> Result<PrefixCache> {
         let t = input_ids.dim(1)?;
         let masks = Masks::prefix(&[t], &[t], t, t, 0, self.half_window, input_ids.device())?;
-        let (hidden, layers) = self.run(input_ids, &masks, 0, None)?;
+        self.encode_prefix_masked(input_ids, &masks)
+    }
+
+    /// Encodes a batch of states (`[g, t]`) under `masks` (see [`Masks::left_padded`]) and
+    /// keeps every layer's keys/values.
+    pub fn encode_prefix_masked(&self, input_ids: &Tensor, masks: &Masks) -> Result<PrefixCache> {
+        let (hidden, layers) = self.run(input_ids, masks, 0, None)?;
         Ok(PrefixCache { layers, hidden })
     }
 

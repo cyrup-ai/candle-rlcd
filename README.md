@@ -7,7 +7,7 @@ no generated tokens.
 
 laya is the reference, not the target. Training uses a direct proper-scoring loss instead of
 laya's REINFORCE term, and a new *prefix* layout encodes the state once per request instead of
-once per question. Serving comes next.
+once per question. `candle-rlcd serve` exposes it over HTTP with TypeSafe's Jev API.
 
 ## Use
 
@@ -31,6 +31,111 @@ the act head's `act_probability`.
 A checkpoint directory holds `rl_agent_config.json`, `model.safetensors`, `encoder/config.json`
 and `tokenizer/` (the Hub layout; `huggingface-cli download convaiinnovations/laya` fetches it).
 
+## Serve: a local Jev API
+
+```sh
+cargo build --release          # add --features cuda / metal / mkl / accelerate as available
+./target/release/candle-rlcd serve --model /path/to/model --port 8080
+```
+
+The server speaks [TypeSafe's Jev API](https://docs.typesafe.ai/api) with the same request,
+response and error types, taken from TypeSafe's published OpenAPI schema
+(`https://api.typesafe.ai/openapi.json`, v0.2.0):
+
+| endpoint | what |
+|---|---|
+| `POST /v1/systemone` | `{"state", "model", "questions": {id: {"type": "choice" \| "score" \| "noul", "instructions", "criteria"}}}` to `{"model", "answers": {id: answer}, "usage"}` |
+| `GET /v1/models` | `{"models": [{"name", "description", "release_date"}]}`: the served model plus the `jev-latest` / `jev-preview` aliases |
+| `GET /health` | not in Jev: status, engine settings and request/batch counters |
+
+Answers carry exactly Jev's fields. A `choice` has `choice`, `probabilities` and
+`confidence`; a `score` has `score` (the expected level), `legend`, `probabilities` and
+`confidence`; a `noul` has `noul` (p(yes)). Probabilities use the model's fitted temperatures. Invalid bodies get Jev's FastAPI-style
+`422 {"detail": [{"type", "loc", "msg", "input", "ctx"}]}`, a full queue gets `529` with
+`retry-after`, and `--api-key` (or `CANDLE_RLCD_API_KEY`) turns on `Authorization: Bearer`
+checks (off by default, since it binds to 127.0.0.1). Responses carry `x-typesafe-request-id`.
+
+TypeSafe's own SDKs work unchanged by pointing them at the server:
+
+```python
+from typesafe_sdk import TypeSafeClient, Choice, Score, Noul   # pip install typesafe-sdk
+with TypeSafeClient(api_key="local", base_url="http://127.0.0.1:8080") as client:
+    r = client.system_one(state="I was charged twice, please refund one.",
+                          questions={"team": Choice(instructions="Which team?", criteria={"billing": "Payments", "technical": "Bugs"}),
+                                     "refund": Noul(instructions="Does the customer want a refund?")})
+    print(r.answers["team"].choice, r.answers["team"].confidence, r.answers["refund"].noul)
+```
+
+This was checked with `typesafe-sdk` 0.7.1: listing models, all three question types and a 422
+error all go through the SDK.
+
+Where it differs from Jev:
+- **`model`**: any name is accepted, and the response reports the served model's name (the
+  directory name, or `--model-name`). There is one model per server.
+- **`confidence`**: Jev's docs give `(k * max p - 1) / (k - 1)` for Choice, and that is what
+  is returned. The Score formula isn't published. The same formula reproduces TypeSafe's
+  3-level Score examples, but not their 4- and 5-level ones, so Score confidence may differ.
+- **`usage.output_tokens`** is 0. `input_tokens` counts the tokens the model read (the state
+  once plus each question in the prefix layout).
+- **Context**: the checkpoint's `max_len` (256 to 1024) applies, not Jev's 32k. Long states are
+  truncated the way laya does it, so conversations keep their newest turns.
+- **Limits**: at most 255 Choice options and 10 Score levels, per Jev's docs.
+- `--extended` adds laya's `answer_confidence` (max p) and `act_probability` to each answer.
+
+### Concurrency
+
+The loaded model is immutable. Every weight is an `Arc`-backed Candle tensor, and a forward
+pass only reads them, so `Laya` is `Send + Sync` (checked at compile time) and one copy is
+shared by all threads. Peak RSS is the same with 1 or 4 workers: 1.3 GB for ModernBERT-base
+and 2.5 GB for laya-large. The server runs:
+
+- **HTTP on a 2-thread Tokio runtime.** Handlers validate and tokenize, then queue the request.
+- **N inference workers** on one bounded queue, each with its own Rayon thread pools, where
+  Candle's CPU kernels run.
+- **Adaptive width.** A worker splits the cores between the passes running and the requests
+  waiting. A lone request gets every core, and a full queue gets one core per worker.
+- **Optional dynamic batching** (`--max-batch-rows N`, `--batch-wait-ms`). A worker drains
+  the queued requests into one forward pass. In the encode-once layout the requests' states
+  are left-padded to a common length and encoded together. RoPE and the sliding window only
+  see relative positions, so each request gets what it would alone (`tests/training.rs`,
+  `tests/serve.rs`).
+
+Defaults: on CPU, one adaptive worker per core and no batching. On GPU, one worker batching up
+to 64 rows. Everything is a flag: `--workers`, `--threads-per-worker` (0 shares one pool),
+`--max-batch-rows`, `--batch-wait-ms`, `--max-queue` and `--no-adaptive`.
+
+`candle-rlcd bench` is a closed-loop load generator. It runs against the engine in process, or
+against a running server with `--url`. These numbers are for a 4-core CPU container in f32,
+using the ModernBERT-base prefix-layout model:
+
+| AG News, 1 question/request | 1 client | 2 clients | 4 clients | 16 clients |
+|---|---|---|---|---|
+| serial: 1 worker x 4 threads | 3.3 req/s, 306 ms | - | 3.1 req/s | 3.2 req/s |
+| 4 workers x 1 thread, fixed | 1.5 req/s, 686 ms | - | 5.7 req/s | 5.8 req/s |
+| 1 worker x 4 threads + batching (64 rows) | 3.4 req/s, 287 ms | - | 3.9 req/s | 3.9 req/s |
+| 4 workers x 1 thread + batching | 1.5 req/s | - | 5.3 req/s | 4.0 req/s |
+| **default: 4 adaptive workers** | **3.4 req/s, 294 ms** | **4.7 req/s** | **5.4 req/s** | **5.6 req/s** |
+
+| synthetic tickets, 3 questions/request | 1 client | 4 clients | 16 clients |
+|---|---|---|---|
+| serial | 7.1 q/s, 436 ms | 7.0 q/s | 6.8 q/s |
+| 1 worker + batching | 7.1 q/s | 7.0 q/s | 7.1 q/s |
+| **default** | **7.0 q/s, 440 ms** | **11.4 q/s** | **11.4 q/s** |
+
+Over HTTP (`bench --url`), the default server gives 3.2 req/s at 311 ms with one client and
+5.3 req/s with four, so the HTTP layer adds about 10 ms.
+
+laya-large (joint layout), AG News: 1.6 req/s at 625 ms with one client, and 2.3 req/s with
+four clients (serial: 1.7 req/s).
+
+On CPU the model is compute bound. One pass on one thread runs at about 48 GFLOP/s, but four
+threads on one pass only reach 2.2x because Candle's elementwise and norm ops are mostly
+single-threaded. Four independent passes do reach about 4x. Batching makes the matmuls bigger,
+not more efficient, and it pads short states up to the longest, so it doesn't pay on CPU. On a
+GPU it's the other way round: one pass leaves most of the device idle and batching fills it.
+That's why GPU builds default to one batching worker. The GPU numbers are untested here, since
+this container has no GPU.
+
 ## Layout
 
 | file | what |
@@ -45,6 +150,8 @@ and `tokenizer/` (the Hub layout; `huggingface-cli download convaiinnovations/la
 | `src/loss.rs` | direct proper-scoring loss (log + spherical + RPS, optional logit noise) |
 | `src/optim.rs` | AdamW with saveable state and param groups, clip-by-global-norm, warmup + cosine |
 | `src/data.rs` | training records, targets, augmentation, AG News / BoolQ / synthetic data, BPE tokenizer training |
+| `src/serve.rs` | Jev-compatible HTTP server: request validation, answers, shared-model worker engine |
+| `src/bench.rs` | closed-loop load generator (in process or over HTTP) |
 | `src/train.rs` | training loop, eval metrics, temperature fitting, checkpoints and resume |
 
 ### Fixes over upstream `candle-transformers` modernbert.rs
