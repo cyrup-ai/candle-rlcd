@@ -112,8 +112,13 @@ Where it differs from Jev:
   truncated the way laya does it, so conversations keep their newest turns.
 - **Limits**: at most 255 Choice options and 10 Score levels, per Jev's docs.
 - `--extended` adds laya's `answer_confidence` (max p) and `act_probability` to each answer.
-- `--max-questions N` refuses requests with more than N questions with a 422. Jev has no such
-  cap. It stops one request from holding a worker for a long time.
+- **Request limits.** A request whose `usage.input_tokens` would exceed 65,536 gets a 422,
+  like Jev's 64k cap (`--max-request-tokens`, 0 turns it off). In laya's layout the state
+  counts once per question, so about 128 questions on a full 512-token state hit the cap.
+  - `--timeout-secs` (default 120) answers 504 to a request that hasn't finished in time. A
+    request still queued at that point is dropped without running.
+  - `--max-questions N` refuses requests with more than N questions with a 422. Jev has no
+    such cap.
 
 ### Several models
 

@@ -75,6 +75,13 @@ enum Cmd {
         /// hold an inference worker.
         #[arg(long)]
         max_questions: Option<usize>,
+        /// Refuse requests that would read more tokens than this (422); Jev's cap is 65536.
+        /// 0 turns it off.
+        #[arg(long, default_value_t = candle_rlcd::serve::JEV_MAX_REQUEST_TOKENS)]
+        max_request_tokens: usize,
+        /// Answer 504 to requests not done within this many seconds (0: no timeout).
+        #[arg(long, default_value_t = 120.0)]
+        timeout_secs: f64,
         /// Temperatures from `candle-rlcd calibrate --out`: `file` for the default model, or
         /// `name=file`. Repeatable.
         #[arg(long)]
@@ -405,6 +412,8 @@ fn main() -> Result<()> {
             api_key,
             extended,
             max_questions,
+            max_request_tokens,
+            timeout_secs,
             calibration,
             engine,
         } => {
@@ -474,6 +483,9 @@ fn main() -> Result<()> {
                 api_key,
                 extended,
                 max_questions,
+                max_request_tokens: (max_request_tokens > 0).then_some(max_request_tokens),
+                timeout: (timeout_secs > 0.0)
+                    .then(|| std::time::Duration::from_secs_f64(timeout_secs)),
             };
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)

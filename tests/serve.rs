@@ -402,3 +402,40 @@ async fn several_models_metrics_and_question_cap() {
         assert!(out.contains(line), "missing {line:?} in\n{out}");
     }
 }
+
+/// Jev's token budget and the request timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_budget_and_timeout() {
+    let serve = |cfg: ServeConfig| async move {
+        let laya = Laya::load(fixture(false), &Device::Cpu, DType::F32).unwrap();
+        let engine = Engine::new(Arc::new(laya), EngineConfig::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(engine, cfg)).await.unwrap() });
+        addr.to_string()
+    };
+    let body = request("Help! My payouts have been failing for 3 days.");
+
+    // The default is Jev's 64k: an ordinary request passes.
+    let addr = serve(ServeConfig::default()).await;
+    let (status, _, r) = call(&addr, "POST", "/v1/systemone", Some(&body), None).await;
+    assert_eq!(status, 200, "{r}");
+    let used = r["usage"]["input_tokens"].as_u64().unwrap() as usize;
+
+    let addr = serve(ServeConfig {
+        max_request_tokens: Some(used - 1),
+        ..ServeConfig::default()
+    })
+    .await;
+    let (status, _, e) = call(&addr, "POST", "/v1/systemone", Some(&body), None).await;
+    assert_eq!(status, 422, "{e}");
+    assert_eq!(e["detail"][0]["ctx"]["actual_tokens"], used);
+
+    let addr = serve(ServeConfig {
+        timeout: Some(Duration::from_nanos(1)),
+        ..ServeConfig::default()
+    })
+    .await;
+    let (status, _, e) = call(&addr, "POST", "/v1/systemone", Some(&body), None).await;
+    assert_eq!(status, 504, "{e}");
+}

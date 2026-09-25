@@ -58,6 +58,9 @@ const _: () = {
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 pub const MAX_SCORE_LEVELS: usize = 10;
 
+/// Jev's per-request token budget.
+pub const JEV_MAX_REQUEST_TOKENS: usize = 65_536;
+
 /// Model names accepted as aliases for the served model, as in Jev.
 pub const ALIASES: [&str; 2] = ["jev-latest", "jev-preview"];
 
@@ -739,7 +742,12 @@ fn worker(laya: &Laya, rx: &Receiver<Job>, cfg: &EngineConfig, pools: &Pools, st
         stats.forward.observe(t0.elapsed());
         out
     };
+    // A caller that gave up (timed out) has dropped its reply: don't spend a pass on it.
+    let next_live = |job: Job| (!job.reply.is_closed()).then_some(job);
     while let Ok(first) = rx.recv() {
+        let Some(first) = next_live(first) else {
+            continue;
+        };
         let mut rows = first.rows.len();
         let mut jobs = vec![first];
         let deadline = Instant::now() + cfg.batch_wait;
@@ -750,6 +758,9 @@ fn worker(laya: &Laya, rx: &Receiver<Job>, cfg: &EngineConfig, pools: &Pools, st
                 rx.recv_deadline(deadline).ok()
             };
             let Some(job) = next else { break };
+            let Some(job) = next_live(job) else {
+                continue;
+            };
             rows += job.rows.len();
             jobs.push(job);
         }
@@ -804,6 +815,11 @@ pub struct ServeConfig {
     /// Requests with more questions than this get a 422 (Jev has no such cap; it bounds how
     /// long one request can hold a worker).
     pub max_questions: Option<usize>,
+    /// Requests whose `usage.input_tokens` would exceed this get a 422, like Jev's 64k cap.
+    pub max_request_tokens: Option<usize>,
+    /// Requests not answered within this get a 504. A request still queued when it times out
+    /// is dropped without running; one already in a forward pass finishes it.
+    pub timeout: Option<Duration>,
 }
 
 impl Default for ServeConfig {
@@ -816,6 +832,8 @@ impl Default for ServeConfig {
             api_key: None,
             extended: false,
             max_questions: None,
+            max_request_tokens: Some(JEV_MAX_REQUEST_TOKENS),
+            timeout: None,
         }
     }
 }
@@ -1033,7 +1051,38 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
         }
     };
     let tokens = input_tokens(&rows);
-    let outs = match engine.run(rows).await {
+    if let Some(max) = app.cfg.max_request_tokens {
+        if tokens > max {
+            let err = FieldError::new(
+                loc(&["body"]),
+                "value_error",
+                format!(
+                    "Value error, the request is {tokens} tokens, more than the limit of {max}"
+                ),
+            )
+            .ctx(json!({"max_tokens": max, "actual_tokens": tokens}));
+            return json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                validation_body(&[err]),
+                &rid,
+            );
+        }
+    }
+    let run = engine.run(rows);
+    let result = match app.cfg.timeout {
+        Some(t) => match tokio::time::timeout(t, run).await {
+            Ok(r) => r,
+            Err(_) => {
+                return json_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    json!({"detail": format!("Timed out after {:.1} s", t.as_secs_f64())}),
+                    &rid,
+                )
+            }
+        },
+        None => run.await,
+    };
+    let outs = match result {
         Ok(o) => o,
         Err(EngineError::Overloaded) => {
             let mut r = json_response(
