@@ -146,9 +146,12 @@ impl EncoderConfig {
     }
 }
 
-/// The subset of `rl_agent_config.json` inference needs.
-#[derive(Debug, Clone, Deserialize)]
+/// The subset of `rl_agent_config.json` inference needs (training writes the same file).
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
 pub struct AgentConfig {
+    /// Sequence layout; absent in laya checkpoints, which use the joint layout.
+    #[serde(default)]
+    pub layout: crate::model::Layout,
     #[serde(default = "default_head_layers")]
     pub head_layers: usize,
     #[serde(default)]

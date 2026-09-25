@@ -7,19 +7,22 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use candle_core::{DType, Device, Tensor};
+use candle_core::{DType, Device};
 use candle_nn::VarBuilder;
 use serde_json::{json, Map, Value};
 use tokenizers::Tokenizer;
 
 use crate::config::{clamp_temperature, AgentConfig, EncoderConfig};
 use crate::head::DecisionHead;
+use crate::model::{DecisionModel, Layout};
 use crate::modernbert::ModernBert;
-use crate::sequence::{build_sequence, encode_state, Criteria, Encoded, QType, Question, Specials};
+use crate::sequence::{
+    build_prefix_sequence, build_sequence, build_state_prefix, encode_state, Criteria, Encoded,
+    QType, Question, Specials,
+};
 
 pub struct Laya {
-    pub encoder: ModernBert,
-    pub head: DecisionHead,
+    pub model: DecisionModel,
     pub cfg: AgentConfig,
     pub encoder_cfg: EncoderConfig,
     pub tokenizer: Tokenizer,
@@ -47,28 +50,13 @@ impl Laya {
             |p: &str| std::fs::read_to_string(dir.join(p)).with_context(|| format!("reading {p}"));
         let cfg: AgentConfig = serde_json::from_str(&read("rl_agent_config.json")?)?;
         let encoder_cfg = EncoderConfig::from_json(&read("encoder/config.json")?)?;
-        let tokenizer = Tokenizer::from_file(dir.join("tokenizer/tokenizer.json"))
-            .map_err(|e| anyhow::anyhow!("loading tokenizer: {e}"))?;
-        let tok_cfg: Option<Value> = read("tokenizer/tokenizer_config.json")
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok());
-        let specials = Specials::resolve(&tokenizer, tok_cfg.as_ref())?;
-
+        let (tokenizer, specials) = load_tokenizer(dir)?;
         let weights = dir.join("model.safetensors");
         // SAFETY: the file is memory-mapped read-only and not modified while the model lives.
         let vb = unsafe { VarBuilder::from_mmaped_safetensors(&[weights], dtype, device)? };
-        let encoder =
-            ModernBert::load(vb.pp("encoder"), &encoder_cfg).context("loading encoder")?;
-        let head = DecisionHead::load(
-            vb.clone(),
-            encoder_cfg.hidden_size,
-            cfg.head_layers,
-            cfg.n_act(),
-        )
-        .context("loading decision head")?;
+        let model = build_model(vb, &cfg, &encoder_cfg)?;
         Ok(Self {
-            encoder,
-            head,
+            model,
             cfg,
             encoder_cfg,
             tokenizer,
@@ -77,11 +65,55 @@ impl Laya {
         })
     }
 
+    /// Assemble from already-built parts (used by training).
+    pub fn from_parts(
+        model: DecisionModel,
+        cfg: AgentConfig,
+        encoder_cfg: EncoderConfig,
+        tokenizer: Tokenizer,
+        specials: Specials,
+        device: &Device,
+    ) -> Self {
+        Self {
+            model,
+            cfg,
+            encoder_cfg,
+            tokenizer,
+            specials,
+            device: device.clone(),
+        }
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// Tokenize a state against each question. The state is tokenized once and shared.
     pub fn encode(&self, state: &Value, questions: &[Question]) -> Result<Vec<Encoded>> {
         let state_ids = encode_state(&self.tokenizer, &self.specials, state)?;
         // Conversations (lists) keep the newest turn: truncate from the left.
         let truncate_left = state.is_array();
+        if self.cfg.layout == Layout::Prefix {
+            let prefix = build_state_prefix(
+                &self.specials,
+                &state_ids,
+                self.cfg.max_len,
+                self.cfg.head_max_len,
+                truncate_left,
+            );
+            return questions
+                .iter()
+                .map(|q| {
+                    build_prefix_sequence(
+                        &self.tokenizer,
+                        &self.specials,
+                        q,
+                        &prefix,
+                        self.cfg.head_max_len,
+                    )
+                })
+                .collect();
+        }
         questions
             .iter()
             .map(|q| {
@@ -98,38 +130,20 @@ impl Laya {
             .collect()
     }
 
-    /// One padded forward over all rows (every question of a request goes in one batch).
+    /// One forward over all rows of a request. In the prefix layout the shared state is
+    /// encoded once; otherwise every row goes through one padded batch.
     pub fn forward(&self, rows: &[Encoded]) -> Result<Vec<RowOutput>> {
         if rows.is_empty() {
             return Ok(vec![]);
         }
-        let n = rows.len();
-        let t = rows.iter().map(|r| r.ids.len()).max().unwrap_or(0);
-        let kmax = rows.iter().map(|r| r.markers.len()).max().unwrap_or(0);
         let pad = self.specials.pad;
-        let mut ids = vec![pad; n * t];
-        let mut att = vec![0u32; n * t];
-        let mut mpos = vec![0u32; n * kmax];
-        let mut mmask = vec![0f32; n * kmax];
-        let mut qt = vec![0u32; n];
-        for (i, r) in rows.iter().enumerate() {
-            ids[i * t..i * t + r.ids.len()].copy_from_slice(&r.ids);
-            att[i * t..i * t + r.ids.len()].fill(1);
-            for (j, &m) in r.markers.iter().enumerate() {
-                mpos[i * kmax + j] = m as u32;
-                mmask[i * kmax + j] = 1.0;
+        let out = match self.model.layout {
+            Layout::Prefix => self.model.forward_prefix(rows, pad, &self.device)?,
+            Layout::Laya => {
+                let batch = self.model.batch(rows, pad, &self.device)?;
+                self.model.forward(&batch, false)?
             }
-            qt[i] = r.qtype as u32;
-        }
-        let dev = &self.device;
-        let ids = Tensor::from_vec(ids, (n, t), dev)?;
-        let att = Tensor::from_vec(att, (n, t), dev)?;
-        let mpos = Tensor::from_vec(mpos, (n, kmax), dev)?;
-        let mmask = Tensor::from_vec(mmask, (n, kmax), dev)?;
-        let qt = Tensor::from_vec(qt, n, dev)?;
-
-        let h = self.encoder.forward(&ids, &att)?;
-        let out = self.head.forward(&h, &att, &mpos, &mmask, &qt)?;
+        };
         let logits = out.logits.to_vec2::<f32>()?;
         let act = candle_nn::ops::softmax_last_dim(&out.act_logits)?.to_vec2::<f32>()?;
         Ok(rows
@@ -145,13 +159,7 @@ impl Laya {
 
     /// Fitted temperature for a question type and option count, clamped to [0.5, 5].
     pub fn temperature(&self, qtype: QType, k: usize) -> f64 {
-        let size = match k {
-            0..=2 => "2",
-            3..=5 => "3-5",
-            6..=10 => "6-10",
-            _ => "11+",
-        };
-        let key = format!("{}:{size}", qtype.name());
+        let key = temperature_key(qtype, k);
         let t = self
             .cfg
             .temperature_by_options
@@ -230,7 +238,51 @@ impl Laya {
     }
 }
 
-fn softmax(logits: &[f32], temp: f32) -> Vec<f32> {
+/// laya's temperature bucket, e.g. `choice:3-5`.
+pub fn temperature_key(qtype: QType, k: usize) -> String {
+    let size = match k {
+        0..=2 => "2",
+        3..=5 => "3-5",
+        6..=10 => "6-10",
+        _ => "11+",
+    };
+    format!("{}:{size}", qtype.name())
+}
+
+/// Tokenizer and special tokens from a checkpoint's `tokenizer/` directory.
+pub fn load_tokenizer(dir: &Path) -> Result<(Tokenizer, Specials)> {
+    load_tokenizer_from(&dir.join("tokenizer"))
+}
+
+/// Tokenizer and special tokens from a directory holding `tokenizer.json` (and optionally
+/// `tokenizer_config.json`).
+pub fn load_tokenizer_from(dir: &Path) -> Result<(Tokenizer, Specials)> {
+    let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))
+        .map_err(|e| anyhow::anyhow!("loading tokenizer from {}: {e}", dir.display()))?;
+    let tok_cfg: Option<Value> = std::fs::read_to_string(dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let specials = Specials::resolve(&tokenizer, tok_cfg.as_ref())?;
+    Ok((tokenizer, specials))
+}
+
+/// Builds the model from a `VarBuilder` rooted at the checkpoint (laya's key names).
+pub fn build_model(
+    vb: VarBuilder,
+    cfg: &AgentConfig,
+    encoder_cfg: &EncoderConfig,
+) -> Result<DecisionModel> {
+    let encoder = ModernBert::load(vb.pp("encoder"), encoder_cfg).context("loading encoder")?;
+    let head = DecisionHead::load(vb, encoder_cfg.hidden_size, cfg.head_layers, cfg.n_act())
+        .context("loading decision head")?;
+    Ok(DecisionModel {
+        encoder,
+        head,
+        layout: cfg.layout,
+    })
+}
+
+pub(crate) fn softmax(logits: &[f32], temp: f32) -> Vec<f32> {
     let z: Vec<f32> = logits.iter().map(|l| l / temp).collect();
     let m = z.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let e: Vec<f32> = z.iter().map(|v| (v - m).exp()).collect();
