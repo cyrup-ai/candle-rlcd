@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "ModernBERT + RLCD typed-decision model (laya-compatible) on Candle"
-repository = "https://github.com/kloudsamurai/candle-rlcd"
+repository = "https://github.com/cyrup-ai/candle-rlcd"
 
 [dependencies]
 anyhow = "1"

@@ -310,6 +310,8 @@ pub struct Encoded {
     pub ids: Vec<u32>,
     pub markers: Vec<usize>,
     pub qtype: QType,
+    /// Prefix layout: number of leading state tokens (`[CLS] state [SEP]`); 0 in laya's layout.
+    pub prefix_len: usize,
 }
 
 pub fn encode_text(tok: &Tokenizer, text: &str) -> Result<Vec<u32>> {
@@ -324,16 +326,14 @@ pub fn encode_state(tok: &Tokenizer, sp: &Specials, state: &Value) -> Result<Vec
     encode_text(tok, &serialize_state(state).replace(&sp.mask_token, " "))
 }
 
-/// laya's `build_sequence` with pre-tokenized state ids.
-pub fn build_sequence(
+/// Tokenized question head: `"<t> question: <ins>"` and each option as `[MASK] opt`, with
+/// laya's budget rules applied (options capped at 48 tokens, and cut to share `head_max_len`).
+fn question_tokens(
     tok: &Tokenizer,
     sp: &Specials,
     q: &Question,
-    state_ids: &[u32],
-    max_len: usize,
     head_max_len: usize,
-    truncate_left: bool,
-) -> Result<Encoded> {
+) -> Result<(Vec<u32>, Vec<Vec<u32>>)> {
     let opts = q.render_options();
     let ins = q.ins.replace(&sp.mask_token, " ");
     let mut head_ids = encode_text(tok, &format!("{} question: {}", q.t.name(), ins))?;
@@ -356,35 +356,103 @@ pub fn build_sequence(
         opt_budget = head_max_len as isize - total(&opt_ids);
     }
     head_ids.truncate(8.max(opt_budget.max(0) as usize));
+    Ok((head_ids, opt_ids))
+}
 
-    let mut ids = Vec::with_capacity(max_len);
+/// Appends `[CLS] head [SEP] [MASK] opt0 ... [SEP]` and returns the marker positions.
+fn push_question(
+    ids: &mut Vec<u32>,
+    sp: &Specials,
+    head: Vec<u32>,
+    opts: Vec<Vec<u32>>,
+) -> Vec<usize> {
     ids.push(sp.cls);
-    ids.extend(head_ids);
+    ids.extend(head);
     ids.push(sp.sep);
-    let mut markers = Vec::with_capacity(opt_ids.len());
-    for o in opt_ids {
+    let mut markers = Vec::with_capacity(opts.len());
+    for o in opts {
         markers.push(ids.len());
         ids.extend(o);
     }
     ids.push(sp.sep);
+    markers
+}
+
+/// laya's `build_sequence` with pre-tokenized state ids.
+pub fn build_sequence(
+    tok: &Tokenizer,
+    sp: &Specials,
+    q: &Question,
+    state_ids: &[u32],
+    max_len: usize,
+    head_max_len: usize,
+    truncate_left: bool,
+) -> Result<Encoded> {
+    let (head_ids, opt_ids) = question_tokens(tok, sp, q, head_max_len)?;
+    let k = opt_ids.len();
+    let mut ids = Vec::with_capacity(max_len);
+    let mut markers = push_question(&mut ids, sp, head_ids, opt_ids);
     let room = max_len.saturating_sub(ids.len() + 1);
-    let st = if truncate_left {
-        &state_ids[state_ids.len().saturating_sub(room)..]
-    } else {
-        &state_ids[..room.min(state_ids.len())]
-    };
-    ids.extend_from_slice(st);
+    ids.extend_from_slice(truncate_state(state_ids, room, truncate_left));
     ids.push(sp.sep);
     ids.truncate(max_len);
     markers.retain(|&m| m < max_len);
     ensure!(
-        markers.len() == opts.len(),
+        markers.len() == k,
         "question options exceed head_max_len={head_max_len}"
     );
     Ok(Encoded {
         ids,
         markers,
         qtype: q.t,
+        prefix_len: 0,
+    })
+}
+
+fn truncate_state(state_ids: &[u32], room: usize, truncate_left: bool) -> &[u32] {
+    if truncate_left {
+        &state_ids[state_ids.len().saturating_sub(room)..]
+    } else {
+        &state_ids[..room.min(state_ids.len())]
+    }
+}
+
+/// Prefix layout's shared state part, `[CLS] state [SEP]`, sized so any question fits after it.
+pub fn build_state_prefix(
+    sp: &Specials,
+    state_ids: &[u32],
+    max_len: usize,
+    head_max_len: usize,
+    truncate_left: bool,
+) -> Vec<u32> {
+    // The question part is at most `head_max_len` tokens plus [CLS], [SEP], [SEP].
+    let room = max_len.saturating_sub(head_max_len + 3 + 2);
+    let mut ids = Vec::with_capacity(room + 2);
+    ids.push(sp.cls);
+    ids.extend_from_slice(truncate_state(state_ids, room, truncate_left));
+    ids.push(sp.sep);
+    ids
+}
+
+/// Prefix layout row: `[CLS] state [SEP] [CLS] head [SEP] [MASK] opt0 ... [SEP]`.
+///
+/// The state comes first so its tokens and positions don't depend on the question: a model
+/// trained with state tokens blind to the question part can encode the state once per request.
+pub fn build_prefix_sequence(
+    tok: &Tokenizer,
+    sp: &Specials,
+    q: &Question,
+    state_prefix: &[u32],
+    head_max_len: usize,
+) -> Result<Encoded> {
+    let (head_ids, opt_ids) = question_tokens(tok, sp, q, head_max_len)?;
+    let mut ids = state_prefix.to_vec();
+    let markers = push_question(&mut ids, sp, head_ids, opt_ids);
+    Ok(Encoded {
+        ids,
+        markers,
+        qtype: q.t,
+        prefix_len: state_prefix.len(),
     })
 }
 
