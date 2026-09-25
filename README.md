@@ -171,6 +171,28 @@ model (random weights, 512 tokens, 4-core CPU container, f32):
 | 4 | 6141 ms | 1852 ms | 3.3x |
 | 8 | 12445 ms | 3186 ms | 3.9x |
 
+### AG News fine-tunes
+
+These runs used a fixed 1,000-row sample of the AG News test set, CPU-only with 4 cores and
+16 GB. Temperatures were fitted on 200 held-out train rows. Brier and ECE are for the
+calibrated probabilities (laya's row is raw, which is its better ECE here):
+
+| model | layout | rows trained | accuracy | Brier | ECE |
+|---|---|---|---|---|---|
+| laya as published | laya | - | 0.927 | 0.115 | 0.036 |
+| laya weights, untuned | prefix | 0 | 0.781 | - | - |
+| `--init laya`, 150 steps | prefix | 2,400 | **0.928** | **0.114** | **0.019** |
+| `--init-encoder ModernBERT-base`, 250 steps | prefix | 4,000 | 0.900 | 0.150 | 0.019 |
+
+The encode-once layout loses 15 points on laya's weights untuned. It gets them back after
+2,400 rows, then matches laya and is better calibrated. ModernBERT-base with a fresh head
+reaches 0.90 on 4,000 rows.
+
+The runs used these settings:
+- laya: `--batch-size 2 --grad-accum 8 --max-len 256` and default learning rates. It trains at
+  ~0.2 rows/s and peaks around 10 GB RSS. Batch 4 runs out of memory in 16 GB.
+- base: `--batch-size 8 --grad-accum 2 --max-len 256 --lr-encoder 5e-5`, at ~0.65 rows/s.
+
 ### Candle fixes for training
 
 - **RoPE had no backward** (`apply_op3_no_bwd`), so Q and K never trained, only V.
