@@ -13,6 +13,7 @@ once per question. `candle-rlcd serve` exposes it over HTTP with TypeSafe's Jev 
 
 - **Prebuilt binaries** for Linux x86_64 and arm64 and for Apple Silicon (built with Metal and
   Accelerate) are attached to each [GitHub release](https://github.com/cyrup-ai/candle-rlcd/releases).
+  Candle's Metal backend needs macOS 15 or later; on older macOS the binary runs on the CPU.
   Pushing a `v*` tag builds them (`.github/workflows/release.yml`).
 - **Docker** (CPU): `docker run -p 8080:8080 -v candle-rlcd:/data ghcr.io/cyrup-ai/candle-rlcd`
   serves laya on port 8080. Weights download to the `/data` volume on first start.

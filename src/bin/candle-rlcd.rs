@@ -363,7 +363,16 @@ fn device(cpu: bool) -> Result<Device> {
         return Ok(Device::new_cuda(0)?);
     }
     if candle_core::utils::metal_is_available() {
-        return Ok(Device::new_metal(0)?);
+        // Candle's Metal backend needs macOS 15 (MTLResidencySet) and panics on older
+        // systems; fall back to the CPU there instead of crashing.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let metal = std::panic::catch_unwind(|| Device::new_metal(0));
+        std::panic::set_hook(hook);
+        match metal {
+            Ok(dev) => return Ok(dev?),
+            Err(_) => eprintln!("Metal is unavailable (it needs macOS 15 or later); using the CPU"),
+        }
     }
     Ok(Device::Cpu)
 }

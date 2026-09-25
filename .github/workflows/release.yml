@@ -20,7 +20,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             features: ""
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             # Metal for the GPU, Accelerate for CPU matmuls.
             features: metal,accelerate
