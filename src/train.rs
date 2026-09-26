@@ -34,7 +34,7 @@ pub struct TrainConfig {
     #[arg(long)]
     pub out: PathBuf,
 
-    /// Start from a model directory (a laya snapshot or one of our checkpoints); every tensor
+    /// Start from a model directory or Hub id (a laya snapshot or one of our checkpoints); every tensor
     /// present there is loaded, the rest keep their fresh init.
     #[arg(long)]
     pub init: Option<PathBuf>,
@@ -592,6 +592,8 @@ impl Trainer {
         if let Some(t) = temps {
             agent["temperature"] = json!(t.by_type);
             agent["temperature_by_options"] = json!(t.by_options);
+            agent["calibration"] =
+                json!({"by": "candle-rlcd train", "split": "eval calibration half"});
         }
         agent["training"] = json!({
             "updates": self.opt.step, "epochs_started": self.epoch + 1,
@@ -666,7 +668,7 @@ fn nll(logits: &[f32], t: &[f32], temp: f64) -> f64 {
 }
 
 /// Golden-section search for the NLL-minimising temperature on a log scale in [0.5, 5].
-fn fit_temperature<'a>(items: impl Iterator<Item = (&'a [f32], &'a [f32])> + Clone) -> f64 {
+pub fn fit_temperature<'a>(items: impl Iterator<Item = (&'a [f32], &'a [f32])> + Clone) -> f64 {
     let f = |lt: f64| items.clone().map(|(l, t)| nll(l, t, lt.exp())).sum::<f64>();
     let (mut a, mut b) = (0.5f64.ln(), 5f64.ln());
     let g = (5f64.sqrt() - 1.0) / 2.0;
@@ -768,17 +770,27 @@ pub fn metrics(exs: &[Example], logits: &[Vec<f32>], temps: Option<&Temperatures
 
 /// Evaluate a saved model directory on labelled records (uses its fitted temperatures).
 pub fn evaluate_dir(model: &Path, data: &Path, dev: &Device) -> Result<Value> {
-    let agent = Laya::load(model, dev, DType::F32)?;
+    evaluate_dir_with(model, data, dev, None)
+}
+
+/// [`evaluate_dir`], optionally with a calibration file's temperatures in place of the model's.
+pub fn evaluate_dir_with(
+    model: &Path,
+    data: &Path,
+    dev: &Device,
+    calibration: Option<&Value>,
+) -> Result<Value> {
+    let mut agent = Laya::load(model, dev, DType::F32)?;
+    if let Some(c) = calibration {
+        agent.apply_calibration(c)?;
+    }
     let exs = load_jsonl(data)?;
     let mut logits = Vec::with_capacity(exs.len());
     for e in &exs {
         let rows = agent.encode(&e.state, std::slice::from_ref(&e.question))?;
         logits.push(agent.forward(&rows)?.remove(0).logits);
     }
-    let temps = Temperatures {
-        by_options: agent.cfg.temperature_by_options.clone(),
-        by_type: agent.cfg.temperature.clone(),
-    };
+    let temps = crate::calibrate::current_temperatures(&agent);
     Ok(json!({
         "raw": metrics(&exs, &logits, None),
         "calibrated": metrics(&exs, &logits, Some(&temps)),

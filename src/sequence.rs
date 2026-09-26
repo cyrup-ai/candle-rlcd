@@ -64,8 +64,9 @@ impl Question {
         };
         let ins = match field("ins", "instructions") {
             Some(Value::String(s)) => s.clone(),
+            // As the server does: null instructions are none at all.
+            None | Some(Value::Null) => String::new(),
             Some(v) => python_str(v),
-            None => String::new(),
         };
         let crit = field("crit", "criteria").cloned().unwrap_or(Value::Null);
         ensure!(

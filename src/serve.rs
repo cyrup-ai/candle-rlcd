@@ -21,6 +21,12 @@
 //!   (optionally waiting `batch_wait` for more) and runs it as one forward pass
 //!   ([`Laya::forward_many`]). It pays off on GPUs; on CPU it did not beat one worker per core.
 //! - A full queue answers `529 Overloaded` with `retry-after`, as Jev does, so the SDKs back off.
+//!
+//! # Several models
+//!
+//! One server can hold several checkpoints ([`router_models`]); a request's `model` picks one by
+//! name, alias or pinned `name@commit`. Each model has its own [`Engine`], and the engines share
+//! one count of running passes so the adaptive width accounts for all of them.
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -39,6 +45,7 @@ use serde_json::{json, Map, Value};
 use tokio::sync::oneshot;
 
 use crate::agent::{round4, RowOutput};
+use crate::metrics::{label, Histogram, HttpMetrics};
 use crate::pipeline::{Budget, Plan, Truncation};
 use crate::sequence::{Criteria, Encoded, QType, Question};
 use crate::Laya;
@@ -51,6 +58,9 @@ const _: () = {
 /// Jev's documented limits: at most 255 options per Choice and 10 levels per Score.
 pub const MAX_CHOICE_OPTIONS: usize = 255;
 pub const MAX_SCORE_LEVELS: usize = 10;
+
+/// Jev's per-request token budget.
+pub const JEV_MAX_REQUEST_TOKENS: usize = 65_536;
 
 /// Model names accepted as aliases for the served model, as in Jev.
 pub const ALIASES: [&str; 2] = ["jev-latest", "jev-preview"];
@@ -538,6 +548,7 @@ type Reply = oneshot::Sender<Result<Vec<RowOutput>, String>>;
 struct Job {
     rows: Vec<Encoded>,
     reply: Reply,
+    queued: Instant,
 }
 
 /// Counters for `/health` and benchmarks.
@@ -548,6 +559,13 @@ pub struct Stats {
     pub rows: AtomicU64,
     /// Forward passes that ran on every core.
     pub burst: AtomicU64,
+    /// Questions answered and the tokens they read (`usage.input_tokens`).
+    pub questions: AtomicU64,
+    pub input_tokens: AtomicU64,
+    /// Time per forward pass.
+    pub forward: Histogram,
+    /// Time requests spent queued before a worker picked them up.
+    pub queue_wait: Histogram,
 }
 
 /// Runs forward passes for many concurrent callers over one shared model.
@@ -556,6 +574,7 @@ pub struct Engine {
     pub config: EngineConfig,
     pub stats: Arc<Stats>,
     tx: Sender<Job>,
+    busy: Arc<AtomicUsize>,
 }
 
 #[derive(Debug)]
@@ -566,10 +585,19 @@ pub enum EngineError {
 
 impl Engine {
     pub fn new(laya: Arc<Laya>, config: EngineConfig) -> Result<Self> {
+        Self::with_shared_busy(laya, config, Arc::new(AtomicUsize::new(0)))
+    }
+
+    /// Like [`Self::new`], counting running passes in `busy`, which several engines (one per
+    /// served model) can share so their adaptive width sees the whole machine's load.
+    pub fn with_shared_busy(
+        laya: Arc<Laya>,
+        config: EngineConfig,
+        busy: Arc<AtomicUsize>,
+    ) -> Result<Self> {
         anyhow::ensure!(config.workers >= 1, "need at least one worker");
         let (tx, rx) = crossbeam_channel::bounded::<Job>(config.max_queue.max(1));
         let stats = Arc::new(Stats::default());
-        let busy = Arc::new(AtomicUsize::new(0));
         for w in 0..config.workers {
             // 0 threads per worker: every worker uses the one global pool.
             let pools = Pools::new(w, &config, busy.clone())?;
@@ -583,7 +611,18 @@ impl Engine {
             config,
             stats,
             tx,
+            busy,
         })
+    }
+
+    /// Requests waiting for a worker.
+    pub fn queue_len(&self) -> usize {
+        self.tx.len()
+    }
+
+    /// Forward passes running now, across every engine sharing this one's count.
+    pub fn running(&self) -> usize {
+        self.busy.load(Ordering::Relaxed)
     }
 
     /// Queues one request's rows and waits for its outputs.
@@ -592,7 +631,11 @@ impl Engine {
         rows: Vec<Encoded>,
     ) -> std::result::Result<Vec<RowOutput>, EngineError> {
         let (reply, rx) = oneshot::channel();
-        match self.tx.try_send(Job { rows, reply }) {
+        match self.tx.try_send(Job {
+            rows,
+            reply,
+            queued: Instant::now(),
+        }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => return Err(EngineError::Overloaded),
             Err(TrySendError::Disconnected(_)) => {
@@ -615,7 +658,11 @@ impl Engine {
     ) -> std::result::Result<Vec<RowOutput>, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
-            .send(Job { rows, reply })
+            .send(Job {
+                rows,
+                reply,
+                queued: Instant::now(),
+            })
             .map_err(|_| EngineError::Failed("inference workers stopped".into()))?;
         match rx.blocking_recv() {
             Ok(Ok(out)) => Ok(out),
@@ -675,6 +722,7 @@ fn worker(laya: &Laya, rx: &Receiver<Job>, cfg: &EngineConfig, pools: &Pools, st
         // waiting, so a lone request gets every core and a full queue gets one worker per
         // core (independent passes parallelize better than splitting each op).
         let running = pools.busy.fetch_add(1, Ordering::SeqCst) + 1;
+        let t0 = Instant::now();
         let out = match pools.own.as_slice() {
             [] => laya.forward_many(groups),
             [(_, p)] => p.install(|| laya.forward_many(groups)),
@@ -692,9 +740,15 @@ fn worker(laya: &Laya, rx: &Receiver<Job>, cfg: &EngineConfig, pools: &Pools, st
             }
         };
         pools.busy.fetch_sub(1, Ordering::SeqCst);
+        stats.forward.observe(t0.elapsed());
         out
     };
+    // A caller that gave up (timed out) has dropped its reply: don't spend a pass on it.
+    let next_live = |job: Job| (!job.reply.is_closed()).then_some(job);
     while let Ok(first) = rx.recv() {
+        let Some(first) = next_live(first) else {
+            continue;
+        };
         let mut rows = first.rows.len();
         let mut jobs = vec![first];
         let deadline = Instant::now() + cfg.batch_wait;
@@ -705,8 +759,14 @@ fn worker(laya: &Laya, rx: &Receiver<Job>, cfg: &EngineConfig, pools: &Pools, st
                 rx.recv_deadline(deadline).ok()
             };
             let Some(job) = next else { break };
+            let Some(job) = next_live(job) else {
+                continue;
+            };
             rows += job.rows.len();
             jobs.push(job);
+        }
+        for j in &jobs {
+            stats.queue_wait.observe(j.queued.elapsed());
         }
         stats.batches.fetch_add(1, Ordering::Relaxed);
         stats.rows.fetch_add(rows as u64, Ordering::Relaxed);
@@ -744,7 +804,7 @@ fn worker(laya: &Laya, rx: &Receiver<Job>, cfg: &EngineConfig, pools: &Pools, st
 #[derive(Debug, Clone)]
 pub struct ServeConfig {
     pub addr: SocketAddr,
-    /// Name reported in responses and listed by `/v1/models`.
+    /// Name reported in responses and listed by `/v1/models` (for [`router`]'s single model).
     pub model_name: String,
     pub description: String,
     /// `YYYY-MM-DD`.
@@ -753,8 +813,45 @@ pub struct ServeConfig {
     pub api_key: Option<String>,
     /// Add laya's extra answer fields.
     pub extended: bool,
+    /// Requests with more questions than this get a 422 (Jev has no such cap; it bounds how
+    /// long one request can hold a worker).
+    pub max_questions: Option<usize>,
+    /// Requests whose `usage.input_tokens` would exceed this get a 422, like Jev's 64k cap.
+    pub max_request_tokens: Option<usize>,
+    /// Requests not answered within this get a 504. A request still queued when it times out
+    /// is dropped without running; one already in a forward pass finishes it.
+    pub timeout: Option<Duration>,
     /// What to do with a question too long for the model's input.
     pub truncation: TruncationPolicy,
+}
+
+impl Default for ServeConfig {
+    fn default() -> Self {
+        Self {
+            addr: SocketAddr::from(([127, 0, 0, 1], 8080)),
+            model_name: "candle-rlcd".into(),
+            description: String::new(),
+            release_date: "1970-01-01".into(),
+            api_key: None,
+            extended: false,
+            max_questions: None,
+            max_request_tokens: Some(JEV_MAX_REQUEST_TOKENS),
+            timeout: None,
+            truncation: TruncationPolicy::Strict,
+        }
+    }
+}
+
+/// One model a server answers with.
+pub struct ServedModel {
+    /// The name requests use and responses report.
+    pub name: String,
+    /// Other names it answers to, such as a pinned `laya@55cf4c4`.
+    pub aliases: Vec<String>,
+    pub description: String,
+    /// `YYYY-MM-DD`.
+    pub release_date: String,
+    pub engine: Engine,
 }
 
 /// What the server does when a question can't fit the model's input whole (the state never
@@ -771,44 +868,77 @@ pub enum TruncationPolicy {
 }
 
 struct AppState {
-    engine: Engine,
+    /// The first model is the default: it answers `jev-latest`, `jev-preview`, and any name
+    /// when it is the only model.
+    models: Vec<ServedModel>,
     cfg: ServeConfig,
-    budget: Budget,
     next_id: AtomicU64,
     started: Instant,
+    http: HttpMetrics,
 }
 
-/// Builds the router (exposed for tests).
+/// Builds the router for one model named by `cfg` (exposed for tests).
 pub fn router(engine: Engine, cfg: ServeConfig) -> Router {
-    let state = Arc::new(AppState {
-        budget: Budget::for_model(&engine.laya),
+    let model = ServedModel {
+        name: cfg.model_name.clone(),
+        aliases: vec![],
+        description: cfg.description.clone(),
+        release_date: cfg.release_date.clone(),
         engine,
+    };
+    router_models(vec![model], cfg)
+}
+
+/// Builds the router for several models; the first is the default.
+pub fn router_models(served: Vec<ServedModel>, cfg: ServeConfig) -> Router {
+    assert!(!served.is_empty(), "serve needs at least one model");
+    let state = Arc::new(AppState {
+        models: served,
         cfg,
         next_id: AtomicU64::new(1),
         started: Instant::now(),
+        http: HttpMetrics::default(),
     });
     Router::new()
         .route("/v1/systemone", post(system_one))
         .route("/v1/models", get(models))
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            track_http,
+        ))
         .layer(axum::extract::DefaultBodyLimit::max(16 << 20))
         .with_state(state)
 }
 
-/// Binds `cfg.addr` and serves until Ctrl-C.
+/// Binds `cfg.addr` and serves one model until Ctrl-C.
 pub async fn serve(engine: Engine, cfg: ServeConfig) -> Result<()> {
+    let model = ServedModel {
+        name: cfg.model_name.clone(),
+        aliases: vec![],
+        description: cfg.description.clone(),
+        release_date: cfg.release_date.clone(),
+        engine,
+    };
+    serve_models(vec![model], cfg).await
+}
+
+/// Binds `cfg.addr` and serves `models` (the first is the default) until Ctrl-C.
+pub async fn serve_models(models: Vec<ServedModel>, cfg: ServeConfig) -> Result<()> {
     let addr = cfg.addr;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
+    let names: Vec<&str> = models.iter().map(|m| m.name.as_str()).collect();
     eprintln!(
-        "serving {} on http://{} (POST /v1/systemone, GET /v1/models)",
-        cfg.model_name,
+        "serving {} on http://{} (POST /v1/systemone, GET /v1/models, GET /metrics)",
+        names.join(", "),
         listener.local_addr()?
     );
-    axum::serve(listener, router(engine, cfg))
+    axum::serve(listener, router_models(models, cfg))
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
@@ -853,6 +983,33 @@ impl AppState {
             .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         Some(r)
     }
+
+    /// The model a request's `model` names: a name or alias, `jev-latest` / `jev-preview`
+    /// for the default, or anything at all when only one model is served.
+    fn pick(&self, name: &str) -> std::result::Result<&ServedModel, Box<FieldError>> {
+        let found = self
+            .models
+            .iter()
+            .find(|m| m.name == name || m.aliases.iter().any(|a| a == name));
+        if let Some(m) = found {
+            return Ok(m);
+        }
+        if self.models.len() == 1 || ALIASES.contains(&name) {
+            return Ok(&self.models[0]);
+        }
+        let names: Vec<&str> = self.models.iter().map(|m| m.name.as_str()).collect();
+        Err(Box::new(
+            FieldError::new(
+                loc(&["body", "model"]),
+                "value_error",
+                format!(
+                    "Value error, unknown model '{name}'; this server has: {}",
+                    names.join(", ")
+                ),
+            )
+            .input(&json!(name)),
+        ))
+    }
 }
 
 async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: Bytes) -> Response {
@@ -870,9 +1027,36 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
             )
         }
     };
-    let laya = &app.engine.laya;
+    let model = match app.pick(&req.model) {
+        Ok(m) => m,
+        Err(e) => {
+            return json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                validation_body(&[*e]),
+                &rid,
+            )
+        }
+    };
+    if let Some(max) = app.cfg.max_questions {
+        let n = req.questions.len();
+        if n > max {
+            let err = FieldError::new(
+                loc(&["body", "questions"]),
+                "too_long",
+                format!("Dictionary should have at most {max} items after validation, not {n}"),
+            )
+            .ctx(json!({"field_type": "Dictionary", "max_length": max, "actual_length": n}));
+            return json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                validation_body(&[err]),
+                &rid,
+            );
+        }
+    }
+    let engine = &model.engine;
+    let laya = &engine.laya;
     let questions: Vec<Question> = req.questions.iter().map(|(_, q)| q.clone()).collect();
-    let mut plan = match Plan::new(laya, &app.budget, &req.state, questions) {
+    let mut plan = match Plan::new(laya, &Budget::for_model(laya), &req.state, questions) {
         Ok(p) => p,
         Err(e) => {
             let err = FieldError::new(loc(&["body"]), "value_error", format!("{e:#}"));
@@ -898,13 +1082,52 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
             &rid,
         );
     }
+    // Round one reads almost everything (later rounds only re-ask batched Choices over their
+    // finalists), so the token cap is checked against it before anything runs.
+    let tokens = plan.next_tokens();
+    if let Some(max) = app.cfg.max_request_tokens {
+        if tokens > max {
+            let err = FieldError::new(
+                loc(&["body"]),
+                "value_error",
+                format!(
+                    "Value error, the request is {tokens} tokens, more than the limit of {max}"
+                ),
+            )
+            .ctx(json!({"max_tokens": max, "actual_tokens": tokens}));
+            return json_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                validation_body(&[err]),
+                &rid,
+            );
+        }
+    }
+    // One deadline covers every round.
+    let deadline = app
+        .cfg
+        .timeout
+        .map(|t| (t, tokio::time::Instant::now() + t));
     // Round one asks every question; a Choice whose options run in batches needs more.
     loop {
         let rows = plan.rows();
         if rows.is_empty() {
             break;
         }
-        let outs = match app.engine.run(rows).await {
+        let run = engine.run(rows);
+        let result = match deadline {
+            Some((t, at)) => match tokio::time::timeout_at(at, run).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return json_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        json!({"detail": format!("Timed out after {:.1} s", t.as_secs_f64())}),
+                        &rid,
+                    )
+                }
+            },
+            None => run.await,
+        };
+        let outs = match result {
             Ok(o) => o,
             Err(EngineError::Overloaded) => {
                 let mut r = json_response(
@@ -933,6 +1156,13 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
         }
     }
     let tokens = plan.input_tokens();
+    let stats = &engine.stats;
+    stats
+        .questions
+        .fetch_add(req.questions.len() as u64, Ordering::Relaxed);
+    stats
+        .input_tokens
+        .fetch_add(tokens as u64, Ordering::Relaxed);
     let (chunks, state_tokens) = (plan.state_chunks(), plan.state_tokens());
     let rounds: Vec<Vec<usize>> = (0..req.questions.len()).map(|i| plan.rounds(i)).collect();
     let mut answers = Map::new();
@@ -956,7 +1186,7 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
     let mut r = json_response(
         StatusCode::OK,
         json!({
-            "model": app.cfg.model_name,
+            "model": model.name,
             "answers": answers,
             "usage": {"input_tokens": tokens, "output_tokens": 0},
         }),
@@ -1002,31 +1232,48 @@ async fn models(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Respons
     if let Some(r) = app.authorize(&headers, &rid) {
         return r;
     }
-    let c = &app.cfg;
-    let mut names = vec![c.model_name.clone()];
-    names.extend(
-        ALIASES
-            .iter()
-            .map(|a| a.to_string())
-            .filter(|a| *a != c.model_name),
-    );
-    let models: Vec<Value> = names
-        .into_iter()
-        .map(|n| json!({"name": n, "description": c.description, "release_date": c.release_date}))
-        .collect();
-    json_response(StatusCode::OK, json!({"models": models}), &rid)
+    let mut listed: Vec<Value> = vec![];
+    let mut seen = std::collections::HashSet::new();
+    let entry = |n: &str, m: &ServedModel| json!({"name": n, "description": m.description, "release_date": m.release_date});
+    for m in &app.models {
+        for n in std::iter::once(&m.name).chain(&m.aliases) {
+            if seen.insert(n.clone()) {
+                listed.push(entry(n, m));
+            }
+        }
+    }
+    for a in ALIASES {
+        if seen.insert(a.to_string()) {
+            listed.push(entry(a, &app.models[0]));
+        }
+    }
+    json_response(StatusCode::OK, json!({"models": listed}), &rid)
 }
 
 async fn health(State(app): State<Arc<AppState>>) -> Response {
-    let s = &app.engine.stats;
-    let e = &app.engine.config;
+    let default = &app.models[0];
+    let s = &default.engine.stats;
+    let e = &default.engine.config;
     let rid = app.request_id();
+    let models: Vec<Value> = app
+        .models
+        .iter()
+        .map(|m| {
+            json!({
+                "name": m.name,
+                "aliases": m.aliases,
+                "layout": format!("{:?}", m.engine.laya.cfg.layout).to_lowercase(),
+                "requests": m.engine.stats.requests.load(Ordering::Relaxed),
+                "queued": m.engine.queue_len(),
+            })
+        })
+        .collect();
     json_response(
         StatusCode::OK,
         json!({
             "status": "ok",
-            "model": app.cfg.model_name,
-            "layout": format!("{:?}", app.engine.laya.cfg.layout).to_lowercase(),
+            "model": default.name,
+            "layout": format!("{:?}", default.engine.laya.cfg.layout).to_lowercase(),
             "workers": e.workers,
             "threads_per_worker": e.threads_per_worker,
             "adaptive": e.adaptive,
@@ -1035,9 +1282,128 @@ async fn health(State(app): State<Arc<AppState>>) -> Response {
             "requests": s.requests.load(Ordering::Relaxed),
             "batches": s.batches.load(Ordering::Relaxed),
             "rows": s.rows.load(Ordering::Relaxed),
+            "models": models,
         }),
         &rid,
     )
+}
+
+/// Records every response's route, status and latency for `/metrics`.
+async fn track_http(
+    State(app): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // Known routes only, so stray paths can't grow the label set.
+    let route = match req.uri().path() {
+        "/v1/systemone" => "/v1/systemone",
+        "/v1/models" => "/v1/models",
+        "/health" => "/health",
+        "/metrics" => "/metrics",
+        _ => "other",
+    };
+    let t0 = Instant::now();
+    let r = next.run(req).await;
+    app.http.record(route, r.status().as_u16(), t0.elapsed());
+    r
+}
+
+/// Prometheus text format: HTTP responses and latency, and per-model queue depth, passes,
+/// rows, questions, tokens and forward-pass time.
+async fn metrics(State(app): State<Arc<AppState>>) -> Response {
+    use std::fmt::Write;
+    let mut out = String::new();
+    app.http.render(&mut out);
+    let gauge = |out: &mut String, name: &str, help: &str, kind: &str| {
+        let _ = writeln!(out, "# HELP {name} {help}\n# TYPE {name} {kind}");
+    };
+    type Read = fn(&ServedModel) -> f64;
+    let per_model: [(&str, &str, &str, Read); 7] = [
+        (
+            "candle_rlcd_queue_depth",
+            "Requests waiting for an inference worker.",
+            "gauge",
+            |m| m.engine.queue_len() as f64,
+        ),
+        (
+            "candle_rlcd_workers",
+            "Inference worker threads.",
+            "gauge",
+            |m| m.engine.config.workers as f64,
+        ),
+        (
+            "candle_rlcd_requests_total",
+            "Requests run through the model.",
+            "counter",
+            |m| m.engine.stats.requests.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "candle_rlcd_forward_passes_total",
+            "Forward passes (a batch of one or more requests).",
+            "counter",
+            |m| m.engine.stats.batches.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "candle_rlcd_rows_total",
+            "Question rows run through the encoder.",
+            "counter",
+            |m| m.engine.stats.rows.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "candle_rlcd_questions_total",
+            "Questions answered.",
+            "counter",
+            |m| m.engine.stats.questions.load(Ordering::Relaxed) as f64,
+        ),
+        (
+            "candle_rlcd_input_tokens_total",
+            "Tokens read by the model (usage.input_tokens).",
+            "counter",
+            |m| m.engine.stats.input_tokens.load(Ordering::Relaxed) as f64,
+        ),
+    ];
+    for (name, help, kind, read) in per_model {
+        gauge(&mut out, name, help, kind);
+        for m in &app.models {
+            let _ = writeln!(out, "{name}{{model=\"{}\"}} {}", label(&m.name), read(m));
+        }
+    }
+    gauge(
+        &mut out,
+        "candle_rlcd_running_passes",
+        "Forward passes running now, across all models.",
+        "gauge",
+    );
+    let _ = writeln!(
+        out,
+        "candle_rlcd_running_passes {}",
+        app.models[0].engine.running()
+    );
+    type Pick = fn(&Stats) -> &Histogram;
+    let hists: [(&str, &str, Pick); 2] = [
+        (
+            "candle_rlcd_forward_seconds",
+            "Time per forward pass.",
+            |s| &s.forward,
+        ),
+        (
+            "candle_rlcd_queue_wait_seconds",
+            "Time a request waited for a worker.",
+            |s| &s.queue_wait,
+        ),
+    ];
+    for (name, help, pick) in hists {
+        gauge(&mut out, name, help, "histogram");
+        for m in &app.models {
+            pick(&m.engine.stats).render(&mut out, name, &format!("model=\"{}\"", label(&m.name)));
+        }
+    }
+    let mut r = out.into_response();
+    r.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    r
 }
 
 async fn not_found() -> Response {

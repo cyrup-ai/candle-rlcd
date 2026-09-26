@@ -170,6 +170,10 @@ pub struct AgentConfig {
     /// Per `(qtype, k-bucket)` temperature, e.g. `"choice:3-5"`.
     #[serde(default)]
     pub temperature_by_options: BTreeMap<String, f64>,
+    /// Set when candle-rlcd fit the temperatures (`calibrate` or `train`): what they were fit
+    /// on. Absent in laya's shipped configs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration: Option<Value>,
 }
 
 fn default_head_layers() -> usize {

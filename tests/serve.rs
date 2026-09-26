@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use candle_core::{DType, Device};
-use candle_rlcd::serve::{router, Engine, EngineConfig, ServeConfig, TruncationPolicy};
+use candle_rlcd::serve::{
+    router, router_models, Engine, EngineConfig, ServeConfig, ServedModel, TruncationPolicy,
+};
 use candle_rlcd::Laya;
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -64,6 +66,7 @@ async fn start_full(
         api_key: api_key.map(str::to_string),
         extended,
         truncation,
+        ..ServeConfig::default()
     };
     tokio::spawn(async move { axum::serve(listener, router(engine, cfg)).await.unwrap() });
     addr.to_string()
@@ -224,7 +227,7 @@ async fn long_inputs_are_answered_whole_or_refused() {
     let crit: serde_json::Map<String, Value> = (0..255)
         .map(|i| (format!("opt{i}"), json!(format!("category {i}"))))
         .collect();
-    let body = json!({"state": words(200), "model": "m", "questions": {
+    let body = json!({"state": words(60), "model": "m", "questions": {
         "cat": {"type": "choice", "instructions": "Which category?", "criteria": crit},
         "yes": {"type": "noul", "instructions": "Is it about refunds?"}}});
     let (status, head, r) = call(
@@ -377,4 +380,152 @@ async fn batch_check(prefix: bool) {
             expected[i]["answers"]
         );
     }
+}
+
+/// Two models on one server, the /metrics page, and --max-questions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn several_models_metrics_and_question_cap() {
+    let busy = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let model = |dir: PathBuf, name: &str, aliases: &[&str]| ServedModel {
+        name: name.into(),
+        aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        description: format!("{name} model"),
+        release_date: "2026-09-25".into(),
+        engine: Engine::with_shared_busy(
+            Arc::new(Laya::load(&dir, &Device::Cpu, DType::F32).unwrap()),
+            EngineConfig::default(),
+            busy.clone(),
+        )
+        .unwrap(),
+    };
+    let models = vec![
+        model(fixture(false), "joint", &["joint@abc1234"]),
+        model(fixture(true), "prefix", &[]),
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let cfg = ServeConfig {
+        addr,
+        max_questions: Some(2),
+        ..ServeConfig::default()
+    };
+    tokio::spawn(async move {
+        axum::serve(listener, router_models(models, cfg))
+            .await
+            .unwrap()
+    });
+    let addr = addr.to_string();
+    let body = |model: &str, n: usize| {
+        let qs: serde_json::Map<String, Value> = (0..n)
+            .map(|i| {
+                (
+                    format!("q{i}"),
+                    json!({"type": "noul", "instructions": "Urgent?"}),
+                )
+            })
+            .collect();
+        json!({"state": "Payouts failing", "model": model, "questions": qs}).to_string()
+    };
+
+    // Each name reaches its own model; jev-latest is the first; unknown names are refused.
+    for (name, served) in [
+        ("joint", "joint"),
+        ("joint@abc1234", "joint"),
+        ("prefix", "prefix"),
+        ("jev-latest", "joint"),
+    ] {
+        let (status, _, r) = call(&addr, "POST", "/v1/systemone", Some(&body(name, 1)), None).await;
+        assert_eq!(status, 200, "{name}: {r}");
+        assert_eq!(r["model"], served);
+    }
+    let (status, _, e) = call(&addr, "POST", "/v1/systemone", Some(&body("nope", 1)), None).await;
+    assert_eq!(status, 422);
+    assert_eq!(e["detail"][0]["loc"], json!(["body", "model"]));
+
+    let (status, _, e) = call(
+        &addr,
+        "POST",
+        "/v1/systemone",
+        Some(&body("joint", 3)),
+        None,
+    )
+    .await;
+    assert_eq!(status, 422, "{e}");
+    assert_eq!(e["detail"][0]["type"], "too_long");
+    assert_eq!(e["detail"][0]["ctx"]["max_length"], 2);
+
+    let (_, _, m) = call(&addr, "GET", "/v1/models", None, None).await;
+    let names: Vec<&str> = m["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "joint",
+            "joint@abc1234",
+            "prefix",
+            "jev-latest",
+            "jev-preview"
+        ]
+    );
+
+    // Prometheus text.
+    let mut s = TcpStream::connect(&addr).await.unwrap();
+    s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut out = String::new();
+    s.read_to_string(&mut out).await.unwrap();
+    assert!(out.contains("text/plain; version=0.0.4"), "{out}");
+    for line in [
+        "candle_rlcd_requests_total{model=\"joint\"} 3",
+        "candle_rlcd_requests_total{model=\"prefix\"} 1",
+        "candle_rlcd_questions_total{model=\"joint\"} 3",
+        "candle_rlcd_http_requests_total{route=\"/v1/systemone\",status=\"200\"} 4",
+        "candle_rlcd_http_requests_total{route=\"/v1/systemone\",status=\"422\"} 2",
+        "candle_rlcd_forward_seconds_count{model=\"prefix\"} 1",
+        "candle_rlcd_queue_depth{model=\"joint\"} 0",
+    ] {
+        assert!(out.contains(line), "missing {line:?} in\n{out}");
+    }
+}
+
+/// Jev's token budget and the request timeout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn token_budget_and_timeout() {
+    let serve = |cfg: ServeConfig| async move {
+        let laya = Laya::load(fixture(false), &Device::Cpu, DType::F32).unwrap();
+        let engine = Engine::new(Arc::new(laya), EngineConfig::default()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router(engine, cfg)).await.unwrap() });
+        addr.to_string()
+    };
+    let body = request("Help! My payouts have been failing for 3 days.");
+
+    // The default is Jev's 64k: an ordinary request passes.
+    let addr = serve(ServeConfig::default()).await;
+    let (status, _, r) = call(&addr, "POST", "/v1/systemone", Some(&body), None).await;
+    assert_eq!(status, 200, "{r}");
+    let used = r["usage"]["input_tokens"].as_u64().unwrap() as usize;
+
+    let addr = serve(ServeConfig {
+        max_request_tokens: Some(used - 1),
+        ..ServeConfig::default()
+    })
+    .await;
+    let (status, _, e) = call(&addr, "POST", "/v1/systemone", Some(&body), None).await;
+    assert_eq!(status, 422, "{e}");
+    assert_eq!(e["detail"][0]["ctx"]["actual_tokens"], used);
+
+    let addr = serve(ServeConfig {
+        timeout: Some(Duration::from_nanos(1)),
+        ..ServeConfig::default()
+    })
+    .await;
+    let (status, _, e) = call(&addr, "POST", "/v1/systemone", Some(&body), None).await;
+    assert_eq!(status, 504, "{e}");
 }
