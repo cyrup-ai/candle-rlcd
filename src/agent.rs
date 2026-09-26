@@ -196,17 +196,24 @@ impl Laya {
             .collect())
     }
 
-    /// Fitted temperature for a question type and option count, clamped to [0.5, 5].
+    /// Fitted temperature for a question type and option count; see [`effective_temperature`].
     pub fn temperature(&self, qtype: QType, k: usize) -> f64 {
-        let key = temperature_key(qtype, k);
-        let t = self
-            .cfg
-            .temperature_by_options
-            .get(&key)
-            .copied()
-            .or_else(|| self.cfg.temperature.get(qtype as usize).copied())
-            .unwrap_or(1.0);
-        clamp_temperature(t)
+        effective_temperature(&self.cfg, qtype, k)
+    }
+
+    /// Replaces the temperatures with a calibration file's (`candle-rlcd calibrate --out`):
+    /// `temperature`, `temperature_by_options` and `calibration`, as in `rl_agent_config.json`.
+    pub fn apply_calibration(&mut self, cal: &Value) -> Result<()> {
+        let c: CalibrationFile = serde_json::from_value(cal.clone())
+            .context("a calibration file needs \"temperature\" and \"temperature_by_options\"")?;
+        anyhow::ensure!(
+            c.temperature.len() == 3,
+            "\"temperature\" needs 3 values (choice, score, noul)"
+        );
+        self.cfg.temperature = c.temperature;
+        self.cfg.temperature_by_options = c.temperature_by_options;
+        self.cfg.calibration = Some(c.calibration.unwrap_or_else(|| json!({})));
+        Ok(())
     }
 
     /// Jev `/v1/systemone`-shaped call: `questions` is an ordered `{id: question}` object.
@@ -280,6 +287,38 @@ impl Laya {
                 })
             }
         }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CalibrationFile {
+    temperature: Vec<f64>,
+    temperature_by_options: std::collections::BTreeMap<String, f64>,
+    calibration: Option<Value>,
+}
+
+/// Option counts from which a shipped temperature may not sharpen.
+pub const MANY_OPTIONS: usize = 11;
+
+/// The temperature answers use for a question type and option count: the `(type, bucket)`
+/// fit, else the per-type one, clamped to [0.5, 5].
+///
+/// laya's shipped `choice:11+` is 0.1, fit on few examples; even clamped to 0.5 it sharpens,
+/// so an unanswerable question's confidence jumped from 0.24 at 10 options to 0.56 at 11 and
+/// broke confidence-gated routing. Unless the temperatures were refit by `candle-rlcd
+/// calibrate` or `train` (`calibration` in the config), 11+ options never go below 1.0.
+pub fn effective_temperature(cfg: &AgentConfig, qtype: QType, k: usize) -> f64 {
+    let t = cfg
+        .temperature_by_options
+        .get(&temperature_key(qtype, k))
+        .copied()
+        .or_else(|| cfg.temperature.get(qtype as usize).copied())
+        .unwrap_or(1.0);
+    let t = clamp_temperature(t);
+    if k >= MANY_OPTIONS && cfg.calibration.is_none() {
+        t.max(1.0)
+    } else {
+        t
     }
 }
 
