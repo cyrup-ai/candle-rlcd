@@ -362,23 +362,94 @@ fn question_tokens(
     Ok((head_ids, opt_ids))
 }
 
+/// A question's tokens with no budget applied: the head `"<t> question: <ins>"` and each
+/// option as `[MASK] opt`, whole.
+#[derive(Debug, Clone)]
+pub struct QuestionParts {
+    pub head: Vec<u32>,
+    pub opts: Vec<Vec<u32>>,
+}
+
+impl QuestionParts {
+    /// Tokens of `[CLS] head [SEP] opts.. [SEP]` for the options in `which`.
+    pub fn len(&self, which: &[usize]) -> usize {
+        self.head.len() + 3 + which.iter().map(|&i| self.opts[i].len()).sum::<usize>()
+    }
+}
+
+pub fn question_parts(tok: &Tokenizer, sp: &Specials, q: &Question) -> Result<QuestionParts> {
+    let ins = q.ins.replace(&sp.mask_token, " ");
+    let head = encode_text(tok, &format!("{} question: {}", q.t.name(), ins))?;
+    let opts = q
+        .render_options()
+        .iter()
+        .map(|o| {
+            let t = encode_text(tok, &format!(" {}", o.replace(&sp.mask_token, " ")))?;
+            let mut v = Vec::with_capacity(t.len() + 1);
+            v.push(sp.mask);
+            v.extend(t);
+            Ok(v)
+        })
+        .collect::<Result<_>>()?;
+    Ok(QuestionParts { head, opts })
+}
+
 /// Appends `[CLS] head [SEP] [MASK] opt0 ... [SEP]` and returns the marker positions.
-fn push_question(
-    ids: &mut Vec<u32>,
-    sp: &Specials,
-    head: Vec<u32>,
-    opts: Vec<Vec<u32>>,
-) -> Vec<usize> {
+fn push_question<H, O>(ids: &mut Vec<u32>, sp: &Specials, head: H, opts: O) -> Vec<usize>
+where
+    H: AsRef<[u32]>,
+    O: IntoIterator,
+    O::Item: AsRef<[u32]>,
+{
     ids.push(sp.cls);
-    ids.extend(head);
+    ids.extend_from_slice(head.as_ref());
     ids.push(sp.sep);
-    let mut markers = Vec::with_capacity(opts.len());
+    let mut markers = Vec::new();
     for o in opts {
         markers.push(ids.len());
-        ids.extend(o);
+        ids.extend_from_slice(o.as_ref());
     }
     ids.push(sp.sep);
     markers
+}
+
+/// laya's layout row from fitted parts: `[CLS] head [SEP] opts.. [SEP] state [SEP]`, with
+/// nothing cut.
+pub fn joint_row(
+    sp: &Specials,
+    qtype: QType,
+    head: &[u32],
+    opts: &[&[u32]],
+    state: &[u32],
+) -> Encoded {
+    let mut ids = Vec::new();
+    let markers = push_question(&mut ids, sp, head, opts);
+    ids.extend_from_slice(state);
+    ids.push(sp.sep);
+    Encoded {
+        ids,
+        markers,
+        qtype,
+        prefix_len: 0,
+    }
+}
+
+/// Prefix layout row from fitted parts: `prefix` (`[CLS] state [SEP]`) then the question.
+pub fn prefix_row(
+    sp: &Specials,
+    qtype: QType,
+    head: &[u32],
+    opts: &[&[u32]],
+    prefix: &[u32],
+) -> Encoded {
+    let mut ids = prefix.to_vec();
+    let markers = push_question(&mut ids, sp, head, opts);
+    Encoded {
+        ids,
+        markers,
+        qtype,
+        prefix_len: prefix.len(),
+    }
 }
 
 /// laya's `build_sequence` with pre-tokenized state ids.

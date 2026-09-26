@@ -46,6 +46,7 @@ use tokio::sync::oneshot;
 
 use crate::agent::{round4, RowOutput};
 use crate::metrics::{label, Histogram, HttpMetrics};
+use crate::pipeline::{Budget, Plan, Truncation};
 use crate::sequence::{Criteria, Encoded, QType, Question};
 use crate::Laya;
 
@@ -820,6 +821,8 @@ pub struct ServeConfig {
     /// Requests not answered within this get a 504. A request still queued when it times out
     /// is dropped without running; one already in a forward pass finishes it.
     pub timeout: Option<Duration>,
+    /// What to do with a question too long for the model's input.
+    pub truncation: TruncationPolicy,
 }
 
 impl Default for ServeConfig {
@@ -834,6 +837,7 @@ impl Default for ServeConfig {
             max_questions: None,
             max_request_tokens: Some(JEV_MAX_REQUEST_TOKENS),
             timeout: None,
+            truncation: TruncationPolicy::Strict,
         }
     }
 }
@@ -848,6 +852,19 @@ pub struct ServedModel {
     /// `YYYY-MM-DD`.
     pub release_date: String,
     pub engine: Engine,
+}
+
+/// What the server does when a question can't fit the model's input whole (the state never
+/// needs cutting: it runs in chunks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TruncationPolicy {
+    /// Refuse with a 422 naming the question, instead of answering a question the model
+    /// only saw part of.
+    #[default]
+    Strict,
+    /// Cut it, answer, and count it in the `x-truncated-questions` header (and per answer
+    /// with `extended`).
+    Report,
 }
 
 struct AppState {
@@ -1039,8 +1056,8 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
     let engine = &model.engine;
     let laya = &engine.laya;
     let questions: Vec<Question> = req.questions.iter().map(|(_, q)| q.clone()).collect();
-    let rows = match laya.encode(&req.state, &questions) {
-        Ok(r) => r,
+    let mut plan = match Plan::new(laya, &Budget::for_model(laya), &req.state, questions) {
+        Ok(p) => p,
         Err(e) => {
             let err = FieldError::new(loc(&["body"]), "value_error", format!("{e:#}"));
             return json_response(
@@ -1050,7 +1067,24 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
             );
         }
     };
-    let tokens = input_tokens(&rows);
+    let truncated: Vec<(usize, Truncation)> = (0..req.questions.len())
+        .map(|i| (i, plan.truncation(i)))
+        .filter(|(_, t)| t.any())
+        .collect();
+    if app.cfg.truncation == TruncationPolicy::Strict && !truncated.is_empty() {
+        let errs: Vec<FieldError> = truncated
+            .iter()
+            .map(|&(i, t)| truncation_error(&req.questions[i], t))
+            .collect();
+        return json_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            validation_body(&errs),
+            &rid,
+        );
+    }
+    // Round one reads almost everything (later rounds only re-ask batched Choices over their
+    // finalists), so the token cap is checked against it before anything runs.
+    let tokens = plan.next_tokens();
     if let Some(max) = app.cfg.max_request_tokens {
         if tokens > max {
             let err = FieldError::new(
@@ -1068,52 +1102,88 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
             );
         }
     }
-    let run = engine.run(rows);
-    let result = match app.cfg.timeout {
-        Some(t) => match tokio::time::timeout(t, run).await {
-            Ok(r) => r,
-            Err(_) => {
+    // One deadline covers every round.
+    let deadline = app
+        .cfg
+        .timeout
+        .map(|t| (t, tokio::time::Instant::now() + t));
+    // Round one asks every question; a Choice whose options run in batches needs more.
+    loop {
+        let rows = plan.rows();
+        if rows.is_empty() {
+            break;
+        }
+        let run = engine.run(rows);
+        let result = match deadline {
+            Some((t, at)) => match tokio::time::timeout_at(at, run).await {
+                Ok(r) => r,
+                Err(_) => {
+                    return json_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        json!({"detail": format!("Timed out after {:.1} s", t.as_secs_f64())}),
+                        &rid,
+                    )
+                }
+            },
+            None => run.await,
+        };
+        let outs = match result {
+            Ok(o) => o,
+            Err(EngineError::Overloaded) => {
+                let mut r = json_response(
+                    StatusCode::from_u16(529).expect("valid status"),
+                    json!({"detail": "Overloaded: too many queued requests"}),
+                    &rid,
+                );
+                r.headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return r;
+            }
+            Err(EngineError::Failed(e)) => {
                 return json_response(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    json!({"detail": format!("Timed out after {:.1} s", t.as_secs_f64())}),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({"detail": e}),
                     &rid,
                 )
             }
-        },
-        None => run.await,
-    };
-    let outs = match result {
-        Ok(o) => o,
-        Err(EngineError::Overloaded) => {
-            let mut r = json_response(
-                StatusCode::from_u16(529).expect("valid status"),
-                json!({"detail": "Overloaded: too many queued requests"}),
-                &rid,
-            );
-            r.headers_mut()
-                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
-            return r;
-        }
-        Err(EngineError::Failed(e)) => {
+        };
+        if let Err(e) = plan.feed(outs) {
             return json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                json!({"detail": e}),
+                json!({"detail": format!("{e:#}")}),
                 &rid,
-            )
+            );
         }
-    };
+    }
+    let tokens = plan.input_tokens();
     let stats = &engine.stats;
     stats
         .questions
-        .fetch_add(outs.len() as u64, Ordering::Relaxed);
+        .fetch_add(req.questions.len() as u64, Ordering::Relaxed);
     stats
         .input_tokens
         .fetch_add(tokens as u64, Ordering::Relaxed);
+    let (chunks, state_tokens) = (plan.state_chunks(), plan.state_tokens());
+    let rounds: Vec<Vec<usize>> = (0..req.questions.len()).map(|i| plan.rounds(i)).collect();
     let mut answers = Map::new();
-    for ((id, q), out) in req.questions.iter().zip(&outs) {
-        answers.insert(id.clone(), jev_answer(laya, q, out, app.cfg.extended));
+    for (i, ((id, _), (q, out))) in req.questions.iter().zip(plan.finish()).enumerate() {
+        let mut a = jev_answer(laya, &q, &out, app.cfg.extended);
+        if app.cfg.extended {
+            let o = a.as_object_mut().expect("answer is an object");
+            o.insert("state_chunks".into(), json!(chunks));
+            if rounds[i].len() > 1 {
+                o.insert("option_batches".into(), json!(rounds[i]));
+            }
+            if let Some((_, t)) = truncated.iter().find(|(j, _)| *j == i) {
+                o.insert(
+                    "truncated".into(),
+                    json!({"instructions_tokens": t.instructions, "option_tokens": t.options}),
+                );
+            }
+        }
+        answers.insert(id.clone(), a);
     }
-    json_response(
+    let mut r = json_response(
         StatusCode::OK,
         json!({
             "model": model.name,
@@ -1121,7 +1191,40 @@ async fn system_one(State(app): State<Arc<AppState>>, headers: HeaderMap, body: 
             "usage": {"input_tokens": tokens, "output_tokens": 0},
         }),
         &rid,
+    );
+    let h = r.headers_mut();
+    h.insert("x-state-tokens", HeaderValue::from(state_tokens));
+    h.insert("x-state-chunks", HeaderValue::from(chunks));
+    h.insert("x-truncated-questions", HeaderValue::from(truncated.len()));
+    r
+}
+
+/// Strict mode's 422 for a question too long for the model's input.
+fn truncation_error((id, q): &(String, Question), t: Truncation) -> FieldError {
+    let field = if t.instructions > 0 {
+        "instructions"
+    } else {
+        "criteria"
+    };
+    FieldError::new(
+        vec![
+            json!("body"),
+            json!("questions"),
+            json!(id),
+            json!(q.t.name()),
+            json!(field),
+        ],
+        "too_long",
+        format!(
+            "Instructions and options take {} tokens, but at most {} fit in the model's input \
+             next to the state; {} would be cut. Shorten them, or start the server with \
+             --truncation report to answer anyway.",
+            t.question_tokens,
+            t.limit,
+            t.instructions + t.options
+        ),
     )
+    .ctx(json!({"max_length": t.limit, "actual_length": t.question_tokens}))
 }
 
 async fn models(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Response {

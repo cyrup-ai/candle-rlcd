@@ -109,13 +109,50 @@ Where it differs from Jev:
   3-level Score examples, but not their 4- and 5-level ones, so Score confidence may differ.
 - **`usage.output_tokens`** is 0. `input_tokens` counts the tokens the model read (the state
   once plus each question in the prefix layout).
-- **Context**: the checkpoint's `max_len` (256 to 1024) applies, not Jev's 32k. Long states are
-  truncated the way laya does it, so conversations keep their newest turns.
 - **Limits**: at most 255 Choice options and 10 Score levels, per Jev's docs.
+- `--extended` adds laya's `answer_confidence` (max p) and `act_probability` to each answer,
+  plus how the request was fitted (`state_chunks`, `option_batches`, `truncated`).
+
+### Long inputs
+
+laya was trained on 512-token rows with a 192-token question budget and 48 tokens per option,
+and its own sequence builder silently cuts anything past that. The server
+(`src/pipeline.rs`) fits the whole request instead:
+
+- **Instructions and options are kept whole.** A row grows past `max_len` when a long question
+  needs it, so the state keeps at least `max_len / 4` tokens beside it.
+- **Large Choices run in batches.** Options that don't fit one row are scored in batches of
+  about laya's question size; each batch's leaders go on to a final row. Every option still
+  gets a probability: an eliminated option keeps its logit gap to its batch's leader.
+- **Long states run in chunks.** A state longer than the room beside the question is split
+  into overlapping chunks and every question is asked of each. For `noul`, the chunk most in
+  favour of `true` decides (one chunk can show that a document mentions something); for
+  `choice` and `score`, logits are averaged over chunks.
+- **Only a question longer than the encoder's positions (8,192 for ModernBERT) is still cut.**
+  By default the server refuses it with a Jev-shaped 422 (`too_long`, at the question's
+  `instructions`); `--truncation report` cuts it and answers. Every response carries
+  `x-state-tokens`, `x-state-chunks` and `x-truncated-questions` headers.
+
+This costs time in proportion to what is read. On a 4-core CPU with laya-large, the audit's
+probes went from wrong or refused to right, but slower:
+
+| Probe | Before | After |
+|---|---|---|
+| Fact at the end of a 6,400-word document | p(yes) 0.0001, 3.0 s | p(yes) 0.99, 54 s |
+| 77-option Choice | 3/5 right, 1.9 s | 5/5, 7.4 s |
+| 150 / 255-option Choice | 422 | 5/5 each, 14 s / 23 s |
+| Question after a 155-word preamble ("mentions a cat?" on a cat / dog) | 0.0002 / 0.0002 | 0.44 / 0.0 |
+| 13 questions on a 1,700-word state | 53 s, state cut at 512 | 250 s, whole state |
+
+Short requests (question within 192 tokens, state within what's left of `max_len`) are encoded
+exactly as laya does it, so their answers don't change.
+
 - `--extended` adds laya's `answer_confidence` (max p) and `act_probability` to each answer.
 - **Request limits.** A request whose `usage.input_tokens` would exceed 65,536 gets a 422,
   like Jev's 64k cap (`--max-request-tokens`, 0 turns it off). In laya's layout the state
-  counts once per question, so about 128 questions on a full 512-token state hit the cap.
+  counts once per question (and once per question per chunk for a long state), so about 128
+  questions on a full 512-token state hit the cap. The cap is checked against the first round
+  of rows, before anything runs.
   - `--timeout-secs` (default 120) answers 504 to a request that hasn't finished in time. A
     request still queued at that point is dropped without running.
   - `--max-questions N` refuses requests with more than N questions with a 422. Jev has no
@@ -244,6 +281,7 @@ this container has no GPU.
 | `src/loss.rs` | direct proper-scoring loss (log + spherical + RPS, optional logit noise) |
 | `src/optim.rs` | AdamW with saveable state and param groups, clip-by-global-norm, warmup + cosine |
 | `src/data.rs` | training records, targets, augmentation, AG News / BoolQ / synthetic data, BPE tokenizer training |
+| `src/pipeline.rs` | fits long requests: whole questions, batched options, chunked states, truncation reports |
 | `src/serve.rs` | Jev-compatible HTTP server: request validation, answers, shared-model worker engine |
 | `src/bench.rs` | closed-loop load generator (in process or over HTTP) |
 | `src/train.rs` | training loop, eval metrics, temperature fitting, checkpoints and resume |

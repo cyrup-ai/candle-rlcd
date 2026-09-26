@@ -16,6 +16,7 @@ pub mod metrics;
 pub mod model;
 pub mod modernbert;
 pub mod optim;
+pub mod pipeline;
 pub mod sequence;
 pub mod serve;
 pub mod train;
