@@ -18,8 +18,8 @@
 # interrupted stage resumes from its last checkpoint (saved every SAVE_EVERY steps).
 #
 # Settings (environment variables):
-#   BASE=auto|laya|modernbert-base|modernbert-large   starting weights (auto: laya with >= 32 GB
-#                       of memory, else ModernBERT-base)
+#   BASE=auto|modernbert-large|modernbert-base|laya   starting weights (auto: ModernBERT-large with
+#                       >= 32 GB of memory, else ModernBERT-base; laya is opt-in)
 #   SCALE=1             multiplies the training row counts (0.1 for a ~1/10 run)
 #   TEST_SCALE=1        multiplies the dev/test set sizes
 #   TASK_DATA=a.jsonl   your own labelled records (Jev requests + targets/answers), added to stage 3
@@ -72,14 +72,16 @@ command -v "$PYTHON" >/dev/null || die "python3 not found (xcode-select --instal
 
 BASE=${BASE:-auto}
 if [ "$BASE" = auto ]; then
-    if [ "$MEM_GB" -ge 32 ]; then BASE=laya; else BASE=modernbert-base; fi
+    if [ "$MEM_GB" -ge 32 ]; then BASE=modernbert-large; else BASE=modernbert-base; fi
 fi
 case "$BASE" in
-    laya|modernbert-large) BATCH=${BATCH:-4}; ACCUM=${ACCUM:-8}
+    modernbert-large) BATCH=${BATCH:-4}; ACCUM=${ACCUM:-8}
+        LR1=${LR1:-3e-5}; LR2=${LR2:-2e-5}; LR3=${LR3:-1.5e-5} ;;
+    laya) BATCH=${BATCH:-4}; ACCUM=${ACCUM:-8}   # already trained on typed decisions: gentler
         LR1=${LR1:-2.5e-5}; LR2=${LR2:-1.5e-5}; LR3=${LR3:-1e-5} ;;
     modernbert-base) BATCH=${BATCH:-8}; ACCUM=${ACCUM:-4}
         LR1=${LR1:-5e-5}; LR2=${LR2:-3e-5}; LR3=${LR3:-2e-5} ;;
-    *) die "BASE must be auto, laya, modernbert-base or modernbert-large (got $BASE)" ;;
+    *) die "BASE must be auto, modernbert-large, modernbert-base or laya (got $BASE)" ;;
 esac
 cat > "$RUN/run.env" <<EOF
 NAME=$NAME

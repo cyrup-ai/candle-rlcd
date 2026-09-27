@@ -378,9 +378,11 @@ the same 1,000 rows as the earlier AG News results. `manifest.json` lists every 
 
 **Settings** are environment variables:
 
-- `BASE`: `laya` (fine-tune `convaiinnovations/laya`, ModernBERT-large) or
-  `modernbert-base` / `modernbert-large` (fresh head). The default picks `laya` on Macs with 32 GB
-  or more and `modernbert-base` below that.
+- `BASE`: `modernbert-large` or `modernbert-base` (the `answerdotai` encoder with a fresh
+  decision head). The default is ModernBERT-large on Macs with 32 GB or more and ModernBERT-base
+  below that, so the model depends only on ModernBERT and public data. `BASE=laya` fine-tunes
+  `convaiinnovations/laya` instead; either way laya as published is evaluated on the same test
+  sets for comparison (`COMPARE_LAYA=0` skips it).
 - `SCALE`: multiplies the row counts, for example `SCALE=0.1` for a first short run.
 - `TASK_DATA`: your own labelled requests, in the same format `train` and `calibrate` read.
 - Also `BATCH`, `ACCUM`, `MAX_LEN`, `LR1`/`LR2`/`LR3`, `COMPARE_LAYA=0`, `SKIP_BATTERY=1`,
