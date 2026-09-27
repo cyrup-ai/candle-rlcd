@@ -204,13 +204,21 @@ fn load_into(
     Ok((loaded, missing))
 }
 
+const TOKENIZER_FILES: [&str; 3] = [
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+];
+
 pub struct Trainer {
     pub cfg: TrainConfig,
     pub agent: Laya,
     varmap: VarMap,
     opt: AdamW,
     encoder_json: String,
-    tokenizer_dir: PathBuf,
+    /// Tokenizer files, read once at start: a resumed run's source checkpoint can be pruned
+    /// (`--keep`) before the run's later checkpoints are written.
+    tokenizer_files: Vec<(&'static str, Vec<u8>)>,
     epoch: usize,
     batch: usize,
 }
@@ -334,13 +342,20 @@ impl Trainer {
             );
         }
         let agent = Laya::from_parts(model, agent_cfg, encoder_cfg, tokenizer, specials, dev);
+        let mut tokenizer_files = Vec::new();
+        for f in TOKENIZER_FILES {
+            let p = src.tokenizer_dir.join(f);
+            if p.exists() {
+                tokenizer_files.push((f, std::fs::read(&p)?));
+            }
+        }
         Ok(Self {
             cfg,
             agent,
             varmap,
             opt,
             encoder_json: src.encoder_json,
-            tokenizer_dir: src.tokenizer_dir,
+            tokenizer_files,
             epoch,
             batch,
         })
@@ -578,15 +593,8 @@ impl Trainer {
         self.varmap.save(tmp.join("model.safetensors"))?;
         self.opt.save(&tmp.join("optimizer.safetensors"))?;
         std::fs::write(tmp.join("encoder/config.json"), &self.encoder_json)?;
-        for f in [
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "special_tokens_map.json",
-        ] {
-            let src = self.tokenizer_dir.join(f);
-            if src.exists() {
-                std::fs::copy(&src, tmp.join("tokenizer").join(f))?;
-            }
+        for (f, bytes) in &self.tokenizer_files {
+            std::fs::write(tmp.join("tokenizer").join(f), bytes)?;
         }
         let mut agent = serde_json::to_value(&self.agent.cfg)?;
         if let Some(t) = temps {
