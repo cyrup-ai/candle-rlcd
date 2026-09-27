@@ -332,6 +332,65 @@ temperatures give ECE 0.051 here). It runs at about 0.7 s per question on a 4-co
 - In laya's layout each question attends to the state and the state to the question, so the
   state is *encoded* once per question. The prefix layout below removes that.
 
+## Train a general model on a Mac: one command
+
+```sh
+scripts/train-mac.sh my-run        # Apple Silicon, macOS 15+, Rust and python3 installed
+```
+
+It builds with `--features metal,accelerate`, downloads and converts the public training data,
+trains in three stages, calibrates, evaluates and benchmarks. Everything lands in
+`runs/my-run/`:
+
+| path | what |
+|---|---|
+| `model/` | the trained model (weights, config with fitted temperatures, tokenizer): `candle-rlcd serve --model my-run=runs/my-run/model` |
+| `calibration.json` | the temperatures, also written into `model/rl_agent_config.json` |
+| `report.md`, `report.json` | accuracy, Brier and ECE per held-out test set (and laya's on the same sets), the audit battery, throughput, time per step |
+| `eval/`, `battery.*`, `bench-c1.json`, `bench-c4.json` | the raw numbers behind the report |
+| `stages/1..3/` | each stage's final checkpoint and `metrics.jsonl` |
+| `logs/`, `timings.tsv`, `run.env` | the full log and the settings used |
+
+Stopping it is safe: run the same command again and finished stages are skipped, and the
+interrupted one resumes from its last checkpoint (every 200 steps).
+
+**Data** (`scripts/fetch_data.py`, into `data/public/`): 31 public Hugging Face datasets turned
+into Jev-shaped `choice` / `score` / `noul` records, following the recipe from the CLM
+comparison. The three training stages are:
+
+1. **General** (~39k records at `SCALE=1`): topics (AG News, DBpedia, Yahoo Answers), intents
+   (CLINC150, Banking77, TREC), sentiment and emotion (tweets, Yelp and SST-5 as 5-level `score`),
+   NLI (MNLI, RTE, QNLI), paraphrase (QQP), similarity (STS-B as a 6-level `score` with soft
+   targets), reading comprehension and science multiple choice (BoolQ, RACE, SciQ, ARC,
+   OpenBookQA, CommonsenseQA) and IMDB. About 30% of classification records also ask a yes/no
+   "is this about X?" about the same state, as Jev's fan-out does.
+2. **Near-miss negatives** (~14k): intent and topic choices whose distractors are the labels most
+   like the answer (`top_up_failed` next to `top_up_by_card_charge`), "is this about X?" for the
+   closest wrong X, adversarial NLI (ANLI), PAWS paraphrase pairs and HellaSwag endings.
+3. **Task data with 40% replay** (~23k): routing (CLINC, Banking77), spam (SMS, Enron),
+   moderation (offensive, hate, Civil Comments toxicity and threats as soft `p(true)` labels),
+   sentiment, synthetic multi-question tickets and anything in `TASK_DATA`, plus 40% fresh
+   general and near-miss rows so general accuracy doesn't fall away.
+
+No training row repeats across stages. Each dataset's own validation or test split gives
+`dev.jsonl` (temperature fitting) and `test/<source>.jsonl`, plus `test/ag_news_test1k.jsonl`,
+the same 1,000 rows as the earlier AG News results. `manifest.json` lists every source and count.
+
+**Settings** are environment variables:
+
+- `BASE`: `laya` (fine-tune `convaiinnovations/laya`, ModernBERT-large) or
+  `modernbert-base` / `modernbert-large` (fresh head). The default picks `laya` on Macs with 32 GB
+  or more and `modernbert-base` below that.
+- `SCALE`: multiplies the row counts, for example `SCALE=0.1` for a first short run.
+- `TASK_DATA`: your own labelled requests, in the same format `train` and `calibrate` read.
+- Also `BATCH`, `ACCUM`, `MAX_LEN`, `LR1`/`LR2`/`LR3`, `COMPARE_LAYA=0`, `SKIP_BATTERY=1`,
+  `SKIP_BENCH=1`, `CPU=1`, and `HF_TOKEN` for faster downloads.
+
+Before the long run the script trains two steps and evaluates, so a Metal problem shows up
+within a minute rather than hours in. The same script runs on Linux with `CPU=1`, which is how it
+was checked. Training has never run on Metal: it compiles in CI, but the first Mac run is
+the first real test.
+
 ## Training
 
 ```sh

@@ -547,6 +547,7 @@ fn main() -> Result<()> {
                 cfg.init = Some(candle_rlcd::hub::resolve(&init.to_string_lossy())?.dir);
             }
             let dev = device(cpu)?;
+            eprintln!("training on {dev:?}");
             let mut trainer = candle_rlcd::train::Trainer::new(*cfg, &dev)?;
             trainer.run()?;
         }

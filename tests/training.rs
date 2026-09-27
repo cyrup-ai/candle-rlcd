@@ -308,6 +308,17 @@ fn train_checkpoint_resume_and_load() {
     let qs = json!({"team": {"t": "choice", "ins": "Which team?", "crit": {"billing": "charges", "shipping": "parcels"}}});
     let out = model.system_one(&state(), qs.as_object().unwrap()).unwrap();
     assert!(out["team"]["choice"].is_string());
+
+    // Resume in place and run long enough that `--keep` prunes the checkpoint resumed from:
+    // later checkpoints must still carry the tokenizer.
+    let mut in_place = cfg.clone();
+    in_place.resume = Some(dir.join("run/step-2"));
+    in_place.init = None;
+    in_place.max_steps = Some(8);
+    let summary = Trainer::new(in_place, &dev).unwrap().run().unwrap();
+    assert_eq!(summary["step"], 8);
+    assert!(!dir.join("run/step-2").exists());
+    Laya::load(dir.join("run/final"), &dev, DType::F32).unwrap();
     std::fs::remove_dir_all(&dir).ok();
 }
 

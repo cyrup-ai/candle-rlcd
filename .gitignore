@@ -1,3 +1,6 @@
 target/
 /tests/fixtures/*/model.safetensors.tmp
 __pycache__/
+/runs/
+/data/
+/.venv/
